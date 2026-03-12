@@ -1,3 +1,16 @@
+"""
+FVNT Flow Renderer (Stage 2)
+Generates optical flow field from target parsing (PAM output) and source garment,
+then warps the garment for FEM input.
+
+Pipeline:
+1. Load PAM output (predicted_parsing_20ch.npy) as target person clothing parsing
+2. Load garment mask and convert to 20-channel source clothing parsing
+3. Run Stage 2 flow estimation network to generate optical flow
+4. Warp source garment using the flow field
+5. Save warped garment and flow visualization
+"""
+
 import os
 import sys
 import torch
@@ -78,120 +91,255 @@ class DeformConvPack(nn.Module):
 H_MODEL, W_MODEL = 256, 192
 H_HD, W_HD = 1024, 768
 
-def warp_high_res(img_t, low_res_flow, device):
-    """Warps a high-res image using a low-res predicted flow field."""
-    B, _, H_hr, W_hr = img_t.shape
-    _, _, H_lr, W_lr = low_res_flow.shape
-    
-    flow_hr = F.interpolate(low_res_flow, size=(H_hr, W_hr), mode='bilinear', align_corners=True)
-    flow_hr[:, 0] = flow_hr[:, 0] * (W_hr / W_lr)
-    flow_hr[:, 1] = flow_hr[:, 1] * (H_hr / H_lr)
-    
-    gx = torch.arange(W_hr, device=device).view(1,-1).repeat(H_hr,1).view(1,1,H_hr,W_hr).expand(B,-1,-1,-1)
-    gy = torch.arange(H_hr, device=device).view(-1,1).repeat(1,W_hr).view(1,1,H_hr,W_hr).expand(B,-1,-1,-1)
-    grid = torch.cat([gx, gy], 1).float() + flow_hr
-    
-    grid[:, 0] = 2.0 * grid[:, 0] / max(W_hr - 1, 1) - 1.0
-    grid[:, 1] = 2.0 * grid[:, 1] / max(H_hr - 1, 1) - 1.0
-    return F.grid_sample(img_t, grid.permute(0, 2, 3, 1), align_corners=True)
+def warp(x, flow):
+    """Warp tensor x using optical flow field."""
+    B, C, H, W = x.size()
+    xx = torch.arange(0, W).view(1, -1).repeat(H, 1)
+    yy = torch.arange(0, H).view(-1, 1).repeat(1, W)
+    xx = xx.view(1, 1, H, W).repeat(B, 1, 1, 1)
+    yy = yy.view(1, 1, H, W).repeat(B, 1, 1, 1)
+    grid = torch.cat((xx, yy), 1).float().to(x.device)
+    vgrid = grid + flow
+    vgrid[:, 0, :, :] = 2.0 * vgrid[:, 0, :, :] / max(W - 1, 1) - 1.0
+    vgrid[:, 1, :, :] = 2.0 * vgrid[:, 1, :, :] / max(H - 1, 1) - 1.0
+    vgrid = vgrid.permute(0, 2, 3, 1)
+    return F.grid_sample(x, vgrid, align_corners=True)
 
-def prep_tensor(path, device, is_parsing=False):
-    """Formats inputs for the FEM model."""
-    img = Image.open(path).resize((W_MODEL, H_MODEL), Image.NEAREST if is_parsing else Image.BILINEAR)
-    if is_parsing:
-        lbl = np.array(img)
-        out = torch.zeros(20, H_MODEL, W_MODEL)
-        # Place torso/arm/dress regions into specific channels as expected by Stage 2
-        for i in [4, 5, 6, 7]: 
-            mask = (lbl == i) if lbl.max() < 20 else (lbl >= 128)
-            out[i] = torch.from_numpy(mask.astype(np.float32))
-        return out.unsqueeze(0).to(device)
+def flow_to_image(flow):
+    """Convert optical flow to color visualization image (Middlebury color wheel encoding)."""
+    flow_image = np.zeros((flow.shape[0], flow.shape[1], 3), dtype=np.uint8)
+    
+    u = flow[:, :, 0]
+    v = flow[:, :, 1]
+    
+    rad = np.sqrt(u**2 + v**2)
+    rad_max = np.max(rad)
+    
+    if rad_max > 0:
+        u = u / rad_max
+        v = v / rad_max
+    
+    # Middlebury color wheel
+    RY, YG, GC, CB, BM, MR = 15, 6, 4, 11, 13, 6
+    ncols = RY + YG + GC + CB + BM + MR
+    colorwheel = np.zeros((ncols, 3))
+    
+    col = 0
+    colorwheel[0:RY, 0] = 255
+    colorwheel[0:RY, 1] = np.floor(255 * np.arange(0, RY) / RY)
+    col = col + RY
+    
+    colorwheel[col:col+YG, 0] = 255 - np.floor(255 * np.arange(0, YG) / YG)
+    colorwheel[col:col+YG, 1] = 255
+    col = col + YG
+    
+    colorwheel[col:col+GC, 1] = 255
+    colorwheel[col:col+GC, 2] = np.floor(255 * np.arange(0, GC) / GC)
+    col = col + GC
+    
+    colorwheel[col:col+CB, 1] = 255 - np.floor(255 * np.arange(0, CB) / CB)
+    colorwheel[col:col+CB, 2] = 255
+    col = col + CB
+    
+    colorwheel[col:col+BM, 2] = 255
+    colorwheel[col:col+BM, 0] = np.floor(255 * np.arange(0, BM) / BM)
+    col = col + BM
+    
+    colorwheel[col:col+MR, 2] = 255 - np.floor(255 * np.arange(0, MR) / MR)
+    colorwheel[col:col+MR, 0] = 255
+    
+    for i in range(flow.shape[0]):
+        for j in range(flow.shape[1]):
+            dx = u[i, j]
+            dy = v[i, j]
+            rad = np.sqrt(dx**2 + dy**2)
+            a = np.arctan2(-dy, -dx) / np.pi
+            fk = (a + 1.0) / 2.0 * (ncols - 1)
+            k0 = np.floor(fk).astype(int)
+            k1 = k0 + 1
+            if k1 == ncols:
+                k1 = 0
+            f = fk - k0
+            
+            for c in range(3):
+                tmp0 = colorwheel[k0, c]
+                tmp1 = colorwheel[k1, c]
+                col_tmp = (1 - f) * tmp0 + f * tmp1
+                
+                if rad <= 1:
+                    col_tmp = 255 - rad * (255 - col_tmp)
+                else:
+                    col_tmp = col_tmp * 0.75
+                
+                flow_image[i, j, c] = np.uint8(col_tmp)
+    
+    return flow_image
+
+def load_pam_output(pam_npy_path, device):
+    """Load PAM output (20-channel parsing) and convert to target clothing parsing."""
+    pam_data = np.load(pam_npy_path)  # Shape: (20, H, W) or (1, 20, H, W)
+    pam_data = np.squeeze(pam_data)
+    
+    if pam_data.ndim == 2:
+        # If 2D (label map), convert to 20-channel one-hot
+        label_map = pam_data.astype(np.int32)
+        pam_20ch = np.zeros((20, pam_data.shape[0], pam_data.shape[1]))
+        for c in range(20):
+            pam_20ch[c] = (label_map == c).astype(np.float32)
     else:
-        return (torch.from_numpy(np.array(img.convert('RGB'))).permute(2,0,1).float().unsqueeze(0)/127.5-1).to(device)
+        pam_20ch = pam_data
+    
+    # Only keep clothing categories for target parsing
+    cloth_list = [-1, 1, -1, -1, -1, 5, 6, 7, 8, 9, -1, -1, 12, -1, -1, -1, -1, -1, -1, -1]
+    target_cloth_20 = np.zeros((20, pam_20ch.shape[1], pam_20ch.shape[2]))
+    
+    for i in range(20):
+        if cloth_list[i] >= 0:
+            target_cloth_20[i] = pam_20ch[i]
+    
+    return torch.from_numpy(target_cloth_20).float().unsqueeze(0).to(device)
+
+def load_garment_mask(garment_mask_path, device, h_model=H_MODEL, w_model=W_MODEL):
+    """Load garment mask and convert to 20-channel source clothing parsing."""
+    garment_mask_pil = Image.open(garment_mask_path).convert("L").resize((w_model, h_model))
+    garment_mask_np = np.array(garment_mask_pil).astype(np.float32) / 255.0
+    
+    # Create 20-channel garment parsing (place mask in all clothing categories)
+    source_garment_20 = np.zeros((20, h_model, w_model))
+    cloth_list = [-1, 1, -1, -1, -1, 5, 6, 7, 8, 9, -1, -1, 12, -1, -1, -1, -1, -1, -1, -1]
+    
+    for i in range(20):
+        if cloth_list[i] >= 0:
+            source_garment_20[i] = garment_mask_np
+    
+    return torch.from_numpy(source_garment_20).float().unsqueeze(0).to(device)
+
+def load_garment_rgb(garment_rgb_path, device, h_model=H_MODEL, w_model=W_MODEL):
+    """Load garment RGB image."""
+    garment_pil = Image.open(garment_rgb_path).convert("RGB").resize((w_model, h_model))
+    garment_np = np.array(garment_pil).astype(np.float32) / 127.5 - 1.0
+    garment_tensor = torch.from_numpy(garment_np.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
+    return garment_tensor
 
 def main():
-    parser = argparse.ArgumentParser(description="FVNT Flow Renderer Script")
-    parser.add_argument("--person", required=True, help="Path to person target mask")
+    parser = argparse.ArgumentParser(description="FVNT Flow Renderer Script (Stage 2)")
+    parser.add_argument("--pam_output", required=True, help="Path to PAM output: predicted_parsing_20ch.npy")
     parser.add_argument("--garment_rgb", required=True, help="Path to garment RGB image")
     parser.add_argument("--garment_mask", required=True, help="Path to garment mask")
-    parser.add_argument("--checkpoint", required=True, help="Path to Stage 2 model checkpoint")
-    parser.add_argument("--schp", help="Path to target person SCHP parsing (optional, for better sleeve control)")
-    parser.add_argument("--output_dir", default="output", help="Directory to save results")
-    parser.add_argument("--no_projection", action="store_true", help="Disable sleeve projection refinement")
-    parser.add_argument("--sleeve_type", choices=["auto", "short", "long"], default="auto", help="Override sleeve type detection")
+    parser.add_argument("--checkpoint", help="Path to Stage 2 model checkpoint (optional for inference)")
+    parser.add_argument("--output_dir", default="output_flow_renderer", help="Directory to save results")
+    parser.add_argument("--no_gpu", action="store_true", help="Disable GPU and use CPU")
     
     args = parser.parse_args()
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-
+    device = torch.device('cpu' if args.no_gpu else ('cuda' if torch.cuda.is_available() else 'cpu'))
+    print(f"[*] Using device: {device}")
+    
     # Inject DCN before importing model
     inject_dcn()
     from mine.network_stage_2_mine_x2_resflow import Stage_2_generator
-    from utils.projection import project_source_mask
-
-    # Load Model
-    fem = Stage_2_generator(20).to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    fem.load_state_dict(ckpt['G'] if 'G' in ckpt else ckpt)
-    fem.eval()
-    print("[OK] Model loaded.")
-
-    # Prepare Inputs
+    
+    # Load or initialize Stage 2 Flow Renderer
+    print("[*] Initializing Stage 2 Flow Renderer...")
+    flow_renderer = Stage_2_generator(input_dim_1=20).to(device)
+    flow_renderer.eval()
+    
+    if args.checkpoint and os.path.isfile(args.checkpoint):
+        print(f"[*] Loading checkpoint: {args.checkpoint}")
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        if 'G' in ckpt:
+            flow_renderer.load_state_dict(ckpt['G'])
+        else:
+            flow_renderer.load_state_dict(ckpt)
+        print("[OK] Checkpoint loaded.")
+    else:
+        print("[!] No checkpoint provided or file not found. Using untrained model.")
+    
+    # Prepare output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Use user-preferred prep_tensor logic
-    input_1 = prep_tensor(args.person, device, is_parsing=True)
-    input_2 = prep_tensor(args.garment_mask, device, is_parsing=True)
-
-    # 3. Predict Flow
-    ctx = {}
+    # Load inputs
+    print("[*] Loading inputs...")
+    
+    # 1. Load PAM output as target parsing
+    target_parsing_20 = load_pam_output(args.pam_output, device)
+    print(f"    Target (PAM) parsing shape: {target_parsing_20.shape}")
+    
+    # 2. Load garment mask as source parsing
+    source_parsing_20 = load_garment_mask(args.garment_mask, device, H_MODEL, W_MODEL)
+    print(f"    Source garment parsing shape: {source_parsing_20.shape}")
+    
+    # 3. Load garment RGB for warping
+    garment_rgb = load_garment_rgb(args.garment_rgb, device, H_MODEL, W_MODEL)
+    print(f"    Garment RGB shape: {garment_rgb.shape}")
+    
+    # 4. Run Stage 2 to predict optical flow
+    print("[*] Predicting optical flow...")
     with torch.no_grad():
-        flow_list, _ = fem(input_1, input_2, ctx=ctx)
-    low_res_flow = ctx.get('appearance_flow', flow_list[-1])
-
-    # 4. Warp Cloth
-    cloth_hd = Image.open(args.garment_rgb).convert('RGB').resize((W_HD, H_HD))
-    cloth_hd_t = (torch.from_numpy(np.array(cloth_hd)).permute(2,0,1).float().unsqueeze(0)/127.5-1).to(device)
-    warped_hd = warp_high_res(cloth_hd_t, low_res_flow, device)
-    warped_hd_np = ((warped_hd[0].permute(1,2,0).cpu().numpy()+1)*0.5).clip(0,1)
-
-    # 5. Projection Refinement
-    if not args.no_projection:
-        print("Applying projection refinement...")
-        s_mask_hd = Image.open(args.garment_mask).convert('L').resize((W_HD, H_HD))
-        t_mask_hd = Image.open(args.person).convert('L').resize((W_HD, H_HD))
-        
-        # Use provided person mask as anatomical constraint
-        anat_mask_np = np.array(t_mask_hd) / 255.0
-        
-        # If SCHP is provided, we can further refine boundaries (optional)
-        if args.schp:
-            schp_hd = Image.open(args.schp).resize((W_HD, H_HD), Image.NEAREST)
-            schp_np = np.array(schp_hd)
-            print("Using SCHP for boundary refinement.")
-
-        # Upsample flow...
-        flow_hr = F.interpolate(low_res_flow, size=(H_HD, W_HD), mode='bilinear', align_corners=True)
-        flow_hr[:, 0] *= (W_HD / W_MODEL)
-        flow_hr[:, 1] *= (H_HD / H_MODEL)
-        
-        res = project_source_mask(
-            flow_hr,
-            source_mask=np.array(s_mask_hd)/255.0,
-            anatomical_mask=anat_mask_np
-        )
-        warped_hd_np = warped_hd_np * res['projected_mask'][..., None]
-        
-        # Save masks
-        Image.fromarray((res['projected_mask']*255).astype(np.uint8)).save(os.path.join(args.output_dir, "projected_mask.png"))
-        if 'hole_mask' in res:
-            Image.fromarray((res['hole_mask']*255).astype(np.uint8)).save(os.path.join(args.output_dir, "hole_mask.png"))
-
-    # Save final warped garment
-    final_img = Image.fromarray((warped_hd_np * 255).astype(np.uint8))
-    final_img.save(os.path.join(args.output_dir, "warped_garment.png"))
-    print(f"[SUCCESS] Results saved to {args.output_dir}")
+        flow_list, res_flow_list = flow_renderer(target_parsing_20, source_parsing_20)
+    
+    # Use the finest flow field (index -1)
+    flow_final = flow_list[-1]
+    print(f"    Flow field shape: {flow_final.shape}")
+    
+    # 5. Warp garment using predicted flow
+    print("[*] Warping garment with predicted flow...")
+    warped_garment = warp(garment_rgb, flow_final)
+    
+    # 6. Save outputs
+    print("[*] Saving outputs...")
+    
+    # Save warped garment RGB
+    warped_np = warped_garment[0].permute(1, 2, 0).cpu().numpy()
+    warped_np = ((warped_np + 1.0) * 127.5).astype(np.uint8).clip(0, 255)
+    warped_img = Image.fromarray(warped_np, mode='RGB')
+    warped_path = os.path.join(args.output_dir, "warped_garment.png")
+    warped_img.save(warped_path)
+    print(f"    Saved: {warped_path}")
+    
+    # Save flow visualization for coarse→fine levels
+    for idx, flow_level in enumerate(flow_list):
+        flow_np = flow_level[0].permute(1, 2, 0).cpu().numpy()
+        flow_vis = flow_to_image(flow_np)
+        flow_vis_img = Image.fromarray(flow_vis, mode='RGB')
+        flow_level_path = os.path.join(args.output_dir, f"flow_level_{idx}.png")
+        flow_vis_img.save(flow_level_path)
+        print(f"    Saved: {flow_level_path}")
+    
+    # Save final flow field as numpy for Stage 3 FEM
+    flow_final_np = flow_final[0].cpu().numpy()
+    flow_final_npy_path = os.path.join(args.output_dir, "flow_field.npy")
+    np.save(flow_final_npy_path, flow_final_np)
+    print(f"    Saved: {flow_final_npy_path}")
+    
+    # Save input parsing visualizations
+    target_np = target_parsing_20[0].cpu().numpy()
+    target_label = np.argmax(target_np, axis=0).astype(np.uint8)
+    palette = np.array([
+        [0,0,0],[128,0,0],[255,0,0],[0,85,0],[170,0,51],
+        [255,85,0],[0,0,85],[0,119,221],[85,85,0],[0,85,85],
+        [85,51,0],[52,86,128],[0,128,0],[0,0,255],[51,170,221],
+        [0,255,255],[85,255,170],[170,255,85],[255,255,0],[255,170,0]
+    ], dtype=np.uint8)
+    target_rgb = palette[np.minimum(target_label, len(palette)-1)]
+    target_rgb_img = Image.fromarray(target_rgb, mode='RGB')
+    target_rgb_path = os.path.join(args.output_dir, "target_parsing_rgb.png")
+    target_rgb_img.save(target_rgb_path)
+    print(f"    Saved: {target_rgb_path}")
+    
+    source_np = source_parsing_20[0].cpu().numpy()
+    source_label = np.argmax(source_np, axis=0).astype(np.uint8)
+    source_rgb = palette[np.minimum(source_label, len(palette)-1)]
+    source_rgb_img = Image.fromarray(source_rgb, mode='RGB')
+    source_rgb_path = os.path.join(args.output_dir, "source_parsing_rgb.png")
+    source_rgb_img.save(source_rgb_path)
+    print(f"    Saved: {source_rgb_path}")
+    
+    print(f"\n[SUCCESS] Flow Renderer complete! Results saved to: {args.output_dir}")
+    print(f"\nKey outputs for FEM Stage 3:")
+    print(f"  - Warped garment: {warped_path}")
+    print(f"  - Optical flow: {flow_final_npy_path}")
+    print(f"  - Target parsing: {target_rgb_path}")
 
 if __name__ == "__main__":
     main()

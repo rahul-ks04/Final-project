@@ -79,30 +79,26 @@ class PAMRunner:
         c_rgb = self.transform_norm(c_rgb_pil) # [3, H, W], range [-1, 1]
         c_rgb = c_rgb * c_mask_torch # Background becomes EXACTLY 0.0
         
-        # 2. Source Cloth Parsing (20 ch) - TRAINING EXACT MATCH
-        # The model was trained to receive the SOURCE cloth mask ONLY in categories
-        # where the TARGET person has CLOTHING (from cloth_list).
-        # This is the critical fix - do NOT place cloth in all categories.
-        
-        source_cloth_parsing = torch.zeros((20, self.height, self.width))
-        
+        # 2. Source Cloth Parsing (20 ch) - EXACTLY AS IN FVNT PAPER
+        # Load person parsing map
         p_parse_pil = Image.open(person_parse_path).resize((self.width, self.height), Image.NEAREST)
         p_parse_np = np.array(p_parse_pil)
         
-        # Target parsing mask (which clothing categories exist?)
-        target_parsing_cloth_20 = torch.zeros((20, self.height, self.width))
+        # EXACT cloth_list from FVNT training (dataset1_viton_fixhfs.py line 51)
         cloth_list = [-1, 1, -1, -1, -1, 5, 6, 7, 8, 9, -1, -1, 12, -1, -1, -1, -1, -1, -1, -1]
         
+        # Step 1: Identify which clothing categories exist in TARGET person
+        target_parsing_cloth_20 = torch.zeros((20, self.height, self.width))
         for i in range(20):
             if cloth_list[i] >= 0:
-                # This category CAN have clothing
                 mask = (p_parse_np == cloth_list[i]).astype(np.float32)
-                target_parsing_cloth_20[i] += torch.from_numpy(mask)
+                target_parsing_cloth_20[i] = torch.from_numpy(mask)
         
-        # ONLY place source cloth mask in categories where target has clothing
+        # Step 2: Place SOURCE garment mask ONLY in target's clothing categories (CRITICAL)
+        source_cloth_parsing = torch.zeros((20, self.height, self.width))
         for i in range(20):
-            if target_parsing_cloth_20[i].sum() > 0:
-                source_cloth_parsing[i] += c_mask_torch[0]
+            if target_parsing_cloth_20[i].sum() > 0:  # Only if target has this clothing
+                source_cloth_parsing[i] = c_mask_torch[0]
 
         # 3. Hair-Face-Shoes Binary Mask (1 ch) - (dataset1 line 91)
         # HFS: 2: Hair, 13: Face, 18: L-Shoe, 19: R-Shoe

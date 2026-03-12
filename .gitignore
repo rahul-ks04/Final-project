@@ -1,0 +1,26 @@
+# Data & models
+data/
+checkpoints/
+logs/
+results/
+model/
+
+# Python
+__pycache__/
+*.pyc
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Environment
+.env
+
+/Self-Correction-Human-Parsing
+/detectron2
+inputs/
+outputs/
+/FVNT
+/Flow-Style-VTON
+/CIHP_PGN
+/notebooks
+.vscode

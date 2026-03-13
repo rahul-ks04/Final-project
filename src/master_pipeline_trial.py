@@ -255,7 +255,8 @@ def main():
 
     person_no_bg = os.path.join(rembg_dir, "person.png")
     person_parse = os.path.join(parse_dir, "person.png")
-    person_pose = os.path.join(pose_dir, "person_keypoints.json")
+    _pose_stem = os.path.splitext(os.path.basename(person_img))[0]
+    person_pose = os.path.join(pose_dir, f"{_pose_stem}_keypoints.json")
     garment_rgb = os.path.join(garment_dir, "cloth.png")
     garment_mask = os.path.join(garment_dir, "cloth_mask.png")
     pam_npy = os.path.join(pam_dir, "predicted_parsing_20ch.npy")

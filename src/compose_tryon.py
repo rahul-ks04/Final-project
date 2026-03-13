@@ -64,17 +64,25 @@ def compute_uncovered_holes(erase_mask, paste_alpha):
     return (erase_mask > 0.15) & (paste_alpha < 0.12)
 
 
-def match_skin_tone(inpaint_rgb, person_rgb, parse, uncovered_holes, erase_mask):
-    # Prefer visible arm skin reference, then face. Affine per-channel match.
+def match_skin_tone(inpaint_rgb, person_rgb, parse, uncovered_holes, erase_mask, hand_mask=None):
+    # Priority for skin reference: palm (most reliable) > face > visible arm skin.
     ref_pixels = None
-    arm_visible = build_label_mask(parse, ARM_LABELS) * (1.0 - erase_mask)
-    if np.sum(arm_visible > 0.5) > 50:
-        ref_pixels = person_rgb[arm_visible > 0.5]
 
-    if ref_pixels is None or len(ref_pixels) < 50:
+    # 1. Palm / hand pixels — always visible, never erased, best skin match.
+    if hand_mask is not None and np.sum(hand_mask > 0.5) > 30:
+        ref_pixels = person_rgb[hand_mask > 0.5]
+
+    # 2. Face skin.
+    if ref_pixels is None or len(ref_pixels) < 30:
         face_mask = build_label_mask(parse, [13])
         if np.any(face_mask > 0.5):
             ref_pixels = person_rgb[face_mask > 0.5]
+
+    # 3. Visible arm skin (fallback — may be sparse if arms were erased).
+    if ref_pixels is None or len(ref_pixels) < 30:
+        arm_visible = build_label_mask(parse, ARM_LABELS) * (1.0 - erase_mask)
+        if np.sum(arm_visible > 0.5) > 50:
+            ref_pixels = person_rgb[arm_visible > 0.5]
 
     if ref_pixels is None or not np.any(uncovered_holes):
         return np.clip(inpaint_rgb, 0.0, 1.0)
@@ -100,6 +108,7 @@ def run_composition(
     hand_mask_path=None,
     warped_mask_path=None,
     save_debug_masks=True,
+    inpaint_arms=False,
 ):
     orig_rgba = load_rgba(original_rgba_path)
     h, w = orig_rgba.shape[:2]
@@ -125,14 +134,25 @@ def run_composition(
 
     protection = np.clip(preserve_mask + lower_mask + hand_mask, 0.0, 1.0)
 
-    # Erase old garment; optional arm erase where new cloth overlays.
+    # Erase old GARMENT pixels only — NOT bare arm skin (ARM label = visible skin we want to keep).
+    # Critically: do NOT constrain by paste_support (new garment footprint).
+    # Old long sleeves sitting outside the new (shorter) garment footprint must still be erased
+    # so they become holes that LaMa fills with skin tone.  ARM skin pixels are preserved by
+    # arm_restore later, so omitting arm_mask here is safe for all sleeve-length combinations.
     garment_dil = cv2.dilate(old_garment_mask.astype(np.uint8), np.ones((5, 5), np.uint8), iterations=1).astype(np.float32)
-    arm_under_cloth = arm_mask * warped_mask if erase_arms_under_cloth else np.zeros_like(warped_mask)
-
     support_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
     paste_support = cv2.dilate((warped_mask > 0.08).astype(np.uint8), support_kernel, iterations=1).astype(np.float32)
 
-    erase_mask = np.clip(garment_dil * paste_support + arm_under_cloth, 0.0, 1.0)
+    # arm_under_cloth: optional — only erase bare arm skin when explicitly requested
+    # (handles full→half where ARM label appears inside old sleeve region edge cases).
+    if inpaint_arms:
+        arm_under_cloth = arm_mask * paste_support * (1.0 - hand_mask)
+    elif erase_arms_under_cloth:
+        arm_under_cloth = arm_mask * warped_mask
+    else:
+        arm_under_cloth = np.zeros_like(warped_mask)
+
+    erase_mask = np.clip(garment_dil + arm_under_cloth, 0.0, 1.0)
     erase_mask = erase_mask * (1.0 - protection)
 
     # Compose base canvas
@@ -150,9 +170,14 @@ def run_composition(
     # Compute holes and optionally inpaint with LaMa.
     # Raw holes include any erased-but-uncovered region.
     uncovered_holes_raw = compute_uncovered_holes(erase_mask, paste_soft[:, :, 0])
-    # For half->half (or generally visible arms), do NOT inpaint arm/hand regions.
-    # Those should be restored from the original person image.
-    inpaint_exclusion = ((arm_mask > 0.5) | (hand_mask > 0.5))
+    # LaMa exclusion: never inpaint hands; for arms, only exclude pixels that were
+    # NOT erased (i.e., original bare skin we want arm_restore to handle).  Erased
+    # arm pixels (e.g. sleeve-edge wrist area) are legitimate holes for LaMa to fill.
+    if inpaint_arms:
+        inpaint_exclusion = (hand_mask > 0.5)
+    else:
+        arm_not_erased = (arm_mask > 0.5) & (erase_mask < 0.15)
+        inpaint_exclusion = arm_not_erased | (hand_mask > 0.5)
     uncovered_holes = uncovered_holes_raw & (~inpaint_exclusion)
     did_inpaint = False
     if np.any(uncovered_holes):
@@ -165,7 +190,7 @@ def run_composition(
                 hole_mask = Image.fromarray((uncovered_holes.astype(np.uint8) * 255), mode="L")
                 out_pil = lama(in_pil, hole_mask)
                 inpaint_rgb = np.array(out_pil).astype(np.float32) / 255.0
-                inpaint_rgb = match_skin_tone(inpaint_rgb, person_rgb, parse, uncovered_holes, erase_mask)
+                inpaint_rgb = match_skin_tone(inpaint_rgb, person_rgb, parse, uncovered_holes, erase_mask, hand_mask=hand_mask)
 
                 hole_blend = soft_mask(uncovered_holes.astype(np.float32), blur_radius=9)[:, :, None]
                 hole_blend = np.clip(hole_blend, 0.0, 1.0)
@@ -182,10 +207,11 @@ def run_composition(
             canvas = canvas * (1.0 - hole_blend) + person_rgb * hole_blend
 
     # Safety pass: restore original arm pixels where garment coverage is absent.
-    # This directly prevents sleeve/background artifacts from bleeding over bare arms.
+    # Gate by (1 - erase_mask): never restore pixels that were intentionally erased
+    # (e.g. sleeve-edge wrist with old-garment fabric). LaMa already filled those.
     cover_hard = (paste_soft[:, :, 0] > 0.35).astype(np.uint8)
     cover_hard = cv2.dilate(cover_hard, np.ones((5, 5), np.uint8), iterations=1).astype(np.float32)
-    arm_restore_region = arm_mask * (1.0 - cover_hard)
+    arm_restore_region = arm_mask * (1.0 - cover_hard) * (1.0 - erase_mask)
     arm_restore_region = arm_restore_region * (1.0 - hand_mask)
     arm_restore_soft = soft_mask(arm_restore_region, blur_radius=7)[:, :, None]
     arm_restore_soft = np.clip(arm_restore_soft, 0.0, 1.0)
@@ -227,6 +253,7 @@ if __name__ == "__main__":
     parser.add_argument("--hand_mask", default=None, help="Optional hand/finger mask path to protect fingers")
     parser.add_argument("--no_inpaint_skin", action="store_true", help="Disable LaMa inpainting and restore original pixels in holes")
     parser.add_argument("--erase_arms_under_cloth", action="store_true", help="Aggressively erase arm pixels under warped cloth before compositing")
+    parser.add_argument("--inpaint_arms", action="store_true", help="Allow LaMa inpainting on arm regions (hands remain protected)")
     parser.add_argument("--no_debug_masks", action="store_true", help="Disable saving debug masks")
     args = parser.parse_args()
 
@@ -240,4 +267,5 @@ if __name__ == "__main__":
         hand_mask_path=args.hand_mask,
         warped_mask_path=args.warped_mask,
         save_debug_masks=(not args.no_debug_masks),
+        inpaint_arms=args.inpaint_arms,
     )

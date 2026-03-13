@@ -48,6 +48,7 @@ def main():
     parser.add_argument("--garment", help="Path to garment image (auto-detected in inputs/ if omitted)")
     parser.add_argument("--type", choices=["flat", "worn"], default="flat", help="Garment type")
     parser.add_argument("--no_inpaint_skin", action="store_true", help="Disable LaMa inpainting and restore original pixels in holes")
+    parser.add_argument("--inpaint_arms", action="store_true", help="Allow LaMa inpainting on arm regions (hands still protected)")
     parser.add_argument("--no_gpu", action="store_true", help="Force CPU for PAM/FVNT stages")
     parser.add_argument("--pam_mode", choices=["predict", "from_parse"], default="predict", help="Use PAM model prediction or direct parse->20ch fallback for debugging")
     parser.add_argument("--erase_arms_under_cloth", action="store_true", help="Aggressively erase arm pixels under cloth in composition")
@@ -206,6 +207,8 @@ def main():
     ]
     if args.no_inpaint_skin:
         compose_args.append("--no_inpaint_skin")
+    if args.inpaint_arms:
+        compose_args.append("--inpaint_arms")
     if args.erase_arms_under_cloth:
         compose_args.append("--erase_arms_under_cloth")
 

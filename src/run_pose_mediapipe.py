@@ -6,6 +6,16 @@ import cv2
 import numpy as np
 import mediapipe as mp
 
+try:
+    # Older/common API path.
+    MP_POSE = mp.solutions.pose
+    MP_HANDS = mp.solutions.hands
+except AttributeError:
+    # Some builds expose solutions under mediapipe.python.
+    from mediapipe.python import solutions as mp_solutions
+    MP_POSE = mp_solutions.pose
+    MP_HANDS = mp_solutions.hands
+
 
 def _kp_from_landmark(landmarks, idx, width, height):
     lm = landmarks[idx]
@@ -73,8 +83,7 @@ def run_pose(input_path, output_dir):
     h, w = img.shape[:2]
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    mp_pose = mp.solutions.pose
-    with mp_pose.Pose(
+    with MP_POSE.Pose(
         static_image_mode=True,
         model_complexity=2,
         enable_segmentation=False,
@@ -95,12 +104,53 @@ def run_pose(input_path, output_dir):
         ]
     }
 
+    # Build a hand/finger mask using MediaPipe Hands so composition can protect fingers.
+    hand_mask = np.zeros((h, w), dtype=np.uint8)
+    hands_payload = []
+    with MP_HANDS.Hands(
+        static_image_mode=True,
+        max_num_hands=2,
+        min_detection_confidence=0.3,
+    ) as hands:
+        hand_result = hands.process(img_rgb)
+
+    if hand_result.multi_hand_landmarks:
+        for hand_lms in hand_result.multi_hand_landmarks:
+            pts = []
+            one_hand = []
+            for lm in hand_lms.landmark:
+                x = int(np.clip(lm.x * w, 0, w - 1))
+                y = int(np.clip(lm.y * h, 0, h - 1))
+                pts.append([x, y])
+                one_hand.append([float(lm.x), float(lm.y), float(getattr(lm, "z", 0.0))])
+            hands_payload.append(one_hand)
+
+            pts_np = np.array(pts, dtype=np.int32)
+            if len(pts_np) >= 3:
+                hull = cv2.convexHull(pts_np)
+                cv2.fillConvexPoly(hand_mask, hull, 255)
+
+            # Strengthen fingertips and palm center coverage.
+            for tip_idx in [4, 8, 12, 16, 20, 0, 9]:
+                tx, ty = pts[tip_idx]
+                cv2.circle(hand_mask, (tx, ty), 10, 255, -1)
+
+    hand_mask = cv2.dilate(hand_mask, np.ones((7, 7), np.uint8), iterations=1)
+
     base = os.path.splitext(os.path.basename(input_path))[0]
     out_json = os.path.join(output_dir, f"{base}_keypoints.json")
     with open(out_json, "w") as f:
         json.dump(output, f)
 
+    hand_json = os.path.join(output_dir, f"{base}_hands.json")
+    with open(hand_json, "w") as f:
+        json.dump({"hands": hands_payload}, f)
+
+    hand_mask_path = os.path.join(output_dir, f"{base}_hands_mask.png")
+    cv2.imwrite(hand_mask_path, hand_mask)
+
     print(f"Saved pose JSON: {out_json}")
+    print(f"Saved hand mask: {hand_mask_path}")
     print(f"Average confidence: {float(np.mean(keypoints_18[:, 2])):.3f}")
 
 

@@ -17,6 +17,7 @@ import torch
 import shutil
 import numpy as np
 import argparse
+import cv2
 from PIL import Image
 import torch.nn as nn
 import torch.nn.functional as F
@@ -189,13 +190,29 @@ def load_pam_output(pam_npy_path, device):
     else:
         pam_20ch = pam_data
     
-    # Only keep clothing categories for target parsing
-    cloth_list = [-1, 1, -1, -1, -1, 5, 6, 7, 8, 9, -1, -1, 12, -1, -1, -1, -1, -1, -1, -1]
+    # Only keep upper-body clothing categories for tops try-on.
+    # Channel indices correspond to the 20-class CIHP/LIP schema.
+    upper_body_channels = [5, 6, 7]
     target_cloth_20 = np.zeros((20, pam_20ch.shape[1], pam_20ch.shape[2]))
-    
-    for i in range(20):
-        if cloth_list[i] >= 0:
-            target_cloth_20[i] = pam_20ch[i]
+
+    for i in upper_body_channels:
+        target_cloth_20[i] = pam_20ch[i]
+
+    # Clean noisy cloth support from PAM before stage-2 flow estimation.
+    cloth_union = np.sum(target_cloth_20[upper_body_channels], axis=0)
+    cloth_mask = (cloth_union > 0.5).astype(np.uint8)
+    cloth_mask = cv2.morphologyEx(cloth_mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), iterations=1)
+    cloth_mask = cv2.morphologyEx(cloth_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
+
+    # Keep only the largest connected component (main torso garment).
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cloth_mask, connectivity=8)
+    if num_labels > 1:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        keep_label = int(np.argmax(areas)) + 1
+        cloth_mask = (labels == keep_label).astype(np.uint8)
+
+    for i in upper_body_channels:
+        target_cloth_20[i] = target_cloth_20[i] * cloth_mask.astype(np.float32)
     
     return torch.from_numpy(target_cloth_20).float().unsqueeze(0).to(device)
 
@@ -204,15 +221,21 @@ def load_garment_mask(garment_mask_path, device, h_model=H_MODEL, w_model=W_MODE
     garment_mask_pil = Image.open(garment_mask_path).convert("L").resize((w_model, h_model))
     garment_mask_np = np.array(garment_mask_pil).astype(np.float32) / 255.0
     
-    # Create 20-channel garment parsing (place mask in all clothing categories)
+    # Create 20-channel garment parsing for upper-body clothing categories only.
     source_garment_20 = np.zeros((20, h_model, w_model))
-    cloth_list = [-1, 1, -1, -1, -1, 5, 6, 7, 8, 9, -1, -1, 12, -1, -1, -1, -1, -1, -1, -1]
+    upper_body_channels = [5, 6, 7]
     
-    for i in range(20):
-        if cloth_list[i] >= 0:
-            source_garment_20[i] = garment_mask_np
+    for i in upper_body_channels:
+        source_garment_20[i] = garment_mask_np
     
     return torch.from_numpy(source_garment_20).float().unsqueeze(0).to(device)
+
+
+def load_binary_mask_tensor(garment_mask_path, device, h_model=H_MODEL, w_model=W_MODEL):
+    garment_mask_pil = Image.open(garment_mask_path).convert("L").resize((w_model, h_model), Image.NEAREST)
+    garment_mask_np = (np.array(garment_mask_pil).astype(np.float32) / 255.0)
+    garment_mask_np = (garment_mask_np > 0.5).astype(np.float32)
+    return torch.from_numpy(garment_mask_np).float().unsqueeze(0).unsqueeze(0).to(device)
 
 def load_garment_rgb(garment_rgb_path, device, h_model=H_MODEL, w_model=W_MODEL):
     """Load garment RGB image."""
@@ -272,6 +295,9 @@ def main():
     # 3. Load garment RGB for warping
     garment_rgb = load_garment_rgb(args.garment_rgb, device, H_MODEL, W_MODEL)
     print(f"    Garment RGB shape: {garment_rgb.shape}")
+
+    # 3b. Load binary garment mask for exact warped support
+    garment_mask_binary = load_binary_mask_tensor(args.garment_mask, device, H_MODEL, W_MODEL)
     
     # 4. Run Stage 2 to predict optical flow
     print("[*] Predicting optical flow...")
@@ -285,6 +311,9 @@ def main():
     # 5. Warp garment using predicted flow
     print("[*] Warping garment with predicted flow...")
     warped_garment = warp(garment_rgb, flow_final)
+    warped_mask = warp(garment_mask_binary, flow_final)
+    warped_mask = (warped_mask > 0.5).float()
+    warped_garment = warped_garment * warped_mask
     
     # 6. Save outputs
     print("[*] Saving outputs...")
@@ -296,6 +325,11 @@ def main():
     warped_path = os.path.join(args.output_dir, "warped_garment.png")
     warped_img.save(warped_path)
     print(f"    Saved: {warped_path}")
+
+    warped_mask_np = (warped_mask[0, 0].cpu().numpy() * 255.0).astype(np.uint8)
+    warped_mask_path = os.path.join(args.output_dir, "warped_mask.png")
+    Image.fromarray(warped_mask_np, mode='L').save(warped_mask_path)
+    print(f"    Saved: {warped_mask_path}")
     
     # Save flow visualization for coarse→fine levels
     for idx, flow_level in enumerate(flow_list):
@@ -314,18 +348,33 @@ def main():
     
     # Save input parsing visualizations
     target_np = target_parsing_20[0].cpu().numpy()
-    target_label = np.argmax(target_np, axis=0).astype(np.uint8)
     palette = np.array([
         [0,0,0],[128,0,0],[255,0,0],[0,85,0],[170,0,51],
         [255,85,0],[0,0,85],[0,119,221],[85,85,0],[0,85,85],
         [85,51,0],[52,86,128],[0,128,0],[0,0,255],[51,170,221],
         [0,255,255],[85,255,170],[170,255,85],[255,255,0],[255,170,0]
     ], dtype=np.uint8)
+
+    # Reconstruct a human-readable cloth-only visualization from the ORIGINAL PAM argmax,
+    # preserving background for non-clothing pixels.
+    pam_raw = np.squeeze(np.load(args.pam_output))
+    if pam_raw.ndim == 3:
+        pam_label = np.argmax(pam_raw, axis=0).astype(np.uint8)
+    else:
+        pam_label = pam_raw.astype(np.uint8)
+    cloth_ids = np.array([5, 6, 7], dtype=np.uint8)
+    cloth_mask = np.isin(pam_label, cloth_ids)
+    target_label = np.where(cloth_mask, pam_label, 0).astype(np.uint8)
+
     target_rgb = palette[np.minimum(target_label, len(palette)-1)]
     target_rgb_img = Image.fromarray(target_rgb, mode='RGB')
     target_rgb_path = os.path.join(args.output_dir, "target_parsing_rgb.png")
     target_rgb_img.save(target_rgb_path)
     print(f"    Saved: {target_rgb_path}")
+
+    target_mask_path = os.path.join(args.output_dir, "target_cloth_mask.png")
+    Image.fromarray((cloth_mask.astype(np.uint8) * 255), mode='L').save(target_mask_path)
+    print(f"    Saved: {target_mask_path}")
     
     source_np = source_parsing_20[0].cpu().numpy()
     source_label = np.argmax(source_np, axis=0).astype(np.uint8)

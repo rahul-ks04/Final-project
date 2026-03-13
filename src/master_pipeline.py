@@ -1,185 +1,231 @@
-import os
 import argparse
-import subprocess
+import glob
+import os
 import shutil
+import subprocess
 import sys
-from pathlib import Path
+
 
 def run_cmd(python_cmd, script_path, args, cwd=None):
-    """
-    python_cmd: list or string. For conda envs, use ['conda', 'run', '-n', 'envname', 'python']
-    """
     if isinstance(python_cmd, str):
         python_cmd = [python_cmd]
-        
+
     cmd = python_cmd + [script_path] + args
-    # Quote arguments with spaces
-    quoted_cmd = ['"' + str(arg) + '"' if ' ' in str(arg) else str(arg) for arg in cmd]
+    quoted_cmd = [f'"{a}"' if " " in str(a) else str(a) for a in cmd]
     print(f"\n>>> Running: {' '.join(quoted_cmd)}")
-    
-    is_windows = os.name == 'nt'
+
+    is_windows = os.name == "nt"
     result = subprocess.run(cmd, cwd=cwd, shell=is_windows)
-    
     if result.returncode != 0:
         print(f"!!! Error return code {result.returncode} from command.")
         return False
     return True
 
+
+def first_existing(candidates, name):
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    raise FileNotFoundError(f"Missing {name}. Checked: {candidates}")
+
+
+def find_input(project_root, pattern, label):
+    matches = glob.glob(os.path.join(project_root, "inputs", pattern))
+    if not matches:
+        print(f"!!! Error: Could not find {label} matching '{pattern}' in inputs/ folder.")
+        print(f"Please upload a file named '{pattern.replace('*', 'your_ext')}' to {os.path.join(project_root, 'inputs')}")
+        sys.exit(1)
+    for ext in [".jpg", ".jpeg", ".png", ".webp"]:
+        for m in matches:
+            if m.lower().endswith(ext):
+                return m
+    return matches[0]
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Master VITON Inference Pipeline")
+    parser = argparse.ArgumentParser(description="Master Pipeline (Fashn + MediaPipe + PAM + FVNT + LaMa Composition)")
     parser.add_argument("--person", help="Path to person image (auto-detected in inputs/ if omitted)")
     parser.add_argument("--garment", help="Path to garment image (auto-detected in inputs/ if omitted)")
     parser.add_argument("--type", choices=["flat", "worn"], default="flat", help="Garment type")
-    parser.add_argument("--sleeve_type", "--sleeve_length", choices=["none", "half", "full"], default="full", dest="sleeve_type", help="Sleeve type of target garment (also accepts --sleeve_length)")
-    parser.add_argument("--initial_sleeve", choices=["none", "half", "full"], default="half", help="Initial sleeve type of the person (what they are wearing in the photo)")
-    parser.add_argument("--preserve_arms", action="store_true", help="Preserve original arms in agnostic generation")
-    parser.add_argument("--inpaint_skin", action="store_true", default=True, help="Enable GAN-based skin inpainting for occluded arms (e.g. full-to-half sleeve)")
-    
-    # Environment Names
-    parser.add_argument("--parser_env", default="densepose", help="Env for Human Parsing (Fashn Parser)")
-    parser.add_argument("--dp_env", default="densepose")
-    parser.add_argument("--fvnt_env", default="fvnt_env")
-    parser.add_argument("--stylevton_env", default="stylevton")
-    
-    # Conda executable path (using forward slashes for Windows compatibility)
-    parser.add_argument("--conda_path", default=r"C:/Users/hp/anaconda3/condabin/conda.bat")
+    parser.add_argument("--no_inpaint_skin", action="store_true", help="Disable LaMa inpainting and restore original pixels in holes")
+    parser.add_argument("--no_gpu", action="store_true", help="Force CPU for PAM/FVNT stages")
+    parser.add_argument("--pam_mode", choices=["predict", "from_parse"], default="predict", help="Use PAM model prediction or direct parse->20ch fallback for debugging")
+    parser.add_argument("--erase_arms_under_cloth", action="store_true", help="Aggressively erase arm pixels under cloth in composition")
 
-    # Project and Checkpoints
-    parser.add_argument("--project_root", default="d:/Final Project Viton/virtual-tryon")
-    parser.add_argument("--fvnt_ckpt", default="d:/Final Project Viton/virtual-tryon/FVNT/model/stage2_model")
-    parser.add_argument("--stylevton_ckpt", default="d:/Final Project Viton/virtual-tryon/Flow-Style-VTON/checkpoints/ckp/non_aug/PFAFN_gen_epoch_101.pth")
-    parser.add_argument("--output_root", default="d:/Final Project Viton/virtual-tryon/outputs")
+    # Environments
+    parser.add_argument("--preprocess_env", default="densepose", help="Env for rembg, garment preprocessing, MediaPipe")
+    parser.add_argument("--parser_env", default="densepose", help="Env for Fashn parser")
+    parser.add_argument("--pam_env", default="fvnt_env", help="Env for PAM stage")
+    parser.add_argument("--fvnt_env", default="fvnt_env", help="Env for FVNT stage-2")
+    parser.add_argument("--compose_env", default="densepose", help="Env for composition (LaMa)")
+
+    parser.add_argument("--conda_path", default=r"C:/Users/hp/anaconda3/condabin/conda.bat")
+    parser.add_argument("--project_root", default="d:/VITON")
+    parser.add_argument("--output_root", default="d:/VITON/outputs")
+
+    # Checkpoints
+    parser.add_argument("--pam_ckpt", default="", help="Optional explicit PAM checkpoint path")
+    parser.add_argument("--fvnt_ckpt", default="d:/VITON/FVNT/model/stage2_model", help="FVNT stage-2 checkpoint path")
 
     args = parser.parse_args()
-    
+
     p_root = args.project_root
     o_root = args.output_root
+    src_dir = os.path.join(p_root, "src")
     os.makedirs(o_root, exist_ok=True)
 
-    # Conda runner helper
     def conda_python(env_name):
         return [args.conda_path, "run", "--no-capture-output", "-n", env_name, "python"]
 
-    # --- Auto-Detection Trace ---
-    def find_input(pattern, label):
-        import glob
-        matches = glob.glob(os.path.join(p_root, "inputs", pattern))
-        if not matches:
-            print(f"!!! Error: Could not find {label} matching '{pattern}' in inputs/ folder.")
-            print(f"Please upload a file named '{pattern.replace('*', 'your_ext')}' to {os.path.join(p_root, 'inputs')}")
-            sys.exit(1)
-        # Prefer jpeg/jpg/png
-        for ext in ['.jpg', '.jpeg', '.png']:
-            for m in matches:
-                if m.lower().endswith(ext):
-                    return m
-        return matches[0]
+    person_img = args.person if args.person else find_input(p_root, "person.*", "person image")
+    garment_img = args.garment if args.garment else find_input(p_root, "garment.*", "garment image")
 
-    person_img = args.person if args.person else find_input("person.*", "person image")
-    garment_img = args.garment if args.garment else find_input("garment.*", "garment image")
-    
-    print(f"--- Using Inputs ---")
-    print(f"Person: {person_img}")
+    print("--- Using Inputs ---")
+    print(f"Person : {person_img}")
     print(f"Garment: {garment_img}")
-    print(f"--------------------")
+    print("--------------------")
 
-    # Paths to generated files
-    person_no_bg = os.path.join(o_root, "rembg", "person.png")
-    person_parse = os.path.join(o_root, "parse", "person.png")
-    densepose_img = os.path.join(o_root, "densepose", "person_densepose.png")
-    garment_rgb = os.path.join(o_root, "garment", "cloth.png")
-    garment_mask = os.path.join(o_root, "garment", "cloth_mask.png")
-    target_mask = os.path.join(o_root, "target_mask", "target_mask.png")
-    
+    # Output paths
+    rembg_dir = os.path.join(o_root, "rembg")
+    garment_dir = os.path.join(o_root, "garment")
+    parse_dir = os.path.join(o_root, "parse")
+    pose_dir = os.path.join(o_root, "mediapipe")
+    pam_dir = os.path.join(o_root, "pam")
     flow_dir = os.path.join(o_root, "flow_renderer")
-    warped_garment = os.path.join(flow_dir, "warped_garment.png")
-    projected_mask = os.path.join(flow_dir, "projected_mask.png")
-    
-    agnostic_dir = os.path.join(o_root, "agnostic")
-    agnostic_img = os.path.join(agnostic_dir, "img", "person.png")
-    agnostic_mask = os.path.join(agnostic_dir, "mask", "person.png")
-    
-    final_output = os.path.join(o_root, "final", "tryon_result.png")
-    os.makedirs(os.path.dirname(final_output), exist_ok=True)
+    final_dir = os.path.join(o_root, "final")
+    os.makedirs(final_dir, exist_ok=True)
 
-    # 1. Preprocessing Pipeline
-    print("\n=== PHASE 1: PREPROCESSING ===")
-    pre_args = [
-        "--person", person_img,
-        "--garment", garment_img,
-        "--type", args.type,
-        "--sleeve_type", args.sleeve_type,
-        "--output_root", o_root,
-        "--project_root", p_root,
-        "--schp_py", " ".join(conda_python(args.parser_env)),
-        "--dp_py", " ".join(conda_python(args.dp_env)),
-        "--conda_path", args.conda_path
-    ]
-    # Run preprocessing in the densepose environment (has rembg, torch, etc.)
-    if not run_cmd(conda_python(args.dp_env), os.path.join(p_root, "src/preprocess_pipeline.py"), pre_args):
+    person_no_bg = os.path.join(rembg_dir, "person.png")
+    person_parse = os.path.join(parse_dir, "person.png")
+    person_pose = os.path.join(pose_dir, "person_keypoints.json")
+    person_hands_mask = os.path.join(pose_dir, "person_hands_mask.png")
+    garment_rgb = os.path.join(garment_dir, "cloth.png")
+    garment_mask = os.path.join(garment_dir, "cloth_mask.png")
+    pam_npy = os.path.join(pam_dir, "predicted_parsing_20ch.npy")
+    warped_garment = os.path.join(flow_dir, "warped_garment.png")
+    warped_mask = os.path.join(flow_dir, "warped_mask.png")
+    tryon_rgba = os.path.join(final_dir, "tryon_result.png")
+    comp_path = os.path.join(final_dir, "tryon_with_background.png")
+
+    # Resolve PAM ckpt if not explicitly passed.
+    pam_ckpt = args.pam_ckpt.strip() if args.pam_ckpt else ""
+    if not pam_ckpt:
+        pam_ckpt = first_existing(
+            [
+                os.path.join(p_root, "FVNT", "model", "stage_1", "G_stage1_best.pth"),
+                os.path.join(p_root, "FVNT", "model", "stage1_model"),
+                os.path.join(p_root, "checkpoints", "pam.pth"),
+            ],
+            "PAM checkpoint",
+        )
+
+    print("\n=== STAGE 1: PERSON BACKGROUND REMOVAL ===")
+    if not run_cmd(
+        conda_python(args.preprocess_env),
+        os.path.join(src_dir, "remove_background.py"),
+        ["--input", person_img, "--output_dir", rembg_dir],
+    ):
         sys.exit(1)
 
-    # 2. FVNT Flow Renderer
-    print("\n=== PHASE 2: FLOW ESTIMATION (FVNT) ===")
+    print("\n=== STAGE 2: GARMENT PREPROCESSING ===")
+    pre_garment_args = ["--type", args.type, "--input", garment_img, "--output_dir", garment_dir]
+    if not run_cmd(conda_python(args.preprocess_env), os.path.join(src_dir, "preprocess_garment.py"), pre_garment_args):
+        sys.exit(1)
+
+    print("\n=== STAGE 3: FASHN PARSING (CIHP-20) ===")
+    parse_input_dir = os.path.join(o_root, "parse_input")
+    os.makedirs(parse_input_dir, exist_ok=True)
+    parse_person_path = os.path.join(parse_input_dir, "person.png")
+    shutil.copy2(person_img, parse_person_path)
+
+    if not run_cmd(
+        conda_python(args.parser_env),
+        os.path.join(src_dir, "run_fashn_parser.py"),
+        ["--input_dir", parse_input_dir, "--output_dir", parse_dir],
+    ):
+        sys.exit(1)
+
+    print("\n=== STAGE 4: MEDIAPIPE POSE (OPENPOSE-18 JSON) ===")
+    if not run_cmd(
+        conda_python(args.preprocess_env),
+        os.path.join(src_dir, "run_pose_mediapipe.py"),
+        ["--input", person_img, "--output_dir", pose_dir],
+    ):
+        sys.exit(1)
+
+    print("\n=== STAGE 5: PAM (FVNT STAGE-1) ===")
+    if args.pam_mode == "predict":
+        if not run_cmd(
+            conda_python(args.pam_env),
+            os.path.join(src_dir, "run_pam.py"),
+            [
+                "--cloth", garment_rgb,
+                "--cloth_mask", garment_mask,
+                "--parse", person_parse,
+                "--pose", person_pose,
+                "--image", person_img,
+                "--checkpoint", pam_ckpt,
+                "--output_dir", pam_dir,
+            ],
+        ):
+            sys.exit(1)
+    else:
+        print("[*] PAM bypass enabled: using parse map directly as PAM 20ch.")
+        if not run_cmd(
+            conda_python(args.parser_env),
+            os.path.join(src_dir, "make_pam_from_parse.py"),
+            [
+                "--parse", person_parse,
+                "--output_dir", pam_dir,
+            ],
+        ):
+            sys.exit(1)
+
+    print("\n=== STAGE 6: FVNT FLOW RENDERER (STAGE-2) ===")
     flow_args = [
-        "--person", target_mask,
+        "--pam_output", pam_npy,
         "--garment_rgb", garment_rgb,
         "--garment_mask", garment_mask,
         "--checkpoint", args.fvnt_ckpt,
         "--output_dir", flow_dir,
-        "--schp", person_parse
     ]
-    if not run_cmd(conda_python(args.fvnt_env), os.path.join(p_root, "src/fvnt_flow_renderer.py"), flow_args):
+    if args.no_gpu:
+        flow_args.append("--no_gpu")
+
+    if not run_cmd(conda_python(args.fvnt_env), os.path.join(src_dir, "fvnt_flow_renderer.py"), flow_args):
         sys.exit(1)
 
-    # 3. Agnostic Person Generation (Layering Mode)
-    print("\n=== PHASE 3: AGNOSTIC GENERATION (Layering) ===")
-    agnostic_args = [
-        "--image", person_no_bg,
-        "--parse", person_parse,
-        "--output_dir", agnostic_dir,
-        "--warped_mask", projected_mask
-    ]
-    if not run_cmd(conda_python(args.dp_env), os.path.join(p_root, "src/generate_agnostic_person.py"), agnostic_args):
-        sys.exit(1)
-
-    # 4. Layered Try-On Composition (surgical compositing, no GAN)
-    print("\n=== PHASE 4: LAYERED TRY-ON COMPOSITION ===")
-    style_args = [
-        "--agnostic", agnostic_img,
+    print("\n=== STAGE 7: COMPOSITION + LAMA INPAINT ===")
+    compose_args = [
         "--original", person_no_bg,
-        "--agnostic_mask", agnostic_mask,
-        "--warped_cloth", warped_garment,
-        "--warped_mask", projected_mask,
         "--parse", person_parse,
-        "--densepose", densepose_img,
-        "--output_path", final_output,
-        "--initial_sleeve", args.initial_sleeve
+        "--warped_cloth", warped_garment,
+        "--warped_mask", warped_mask,
+        "--hand_mask", person_hands_mask,
+        "--output_path", tryon_rgba,
     ]
-    if args.inpaint_skin:
-        style_args += ["--inpaint_skin", "--checkpoint", args.stylevton_ckpt]
+    if args.no_inpaint_skin:
+        compose_args.append("--no_inpaint_skin")
+    if args.erase_arms_under_cloth:
+        compose_args.append("--erase_arms_under_cloth")
 
-    if not run_cmd(conda_python(args.stylevton_env), os.path.join(p_root, "src/run_stylevton.py"), style_args):
+    if not run_cmd(conda_python(args.compose_env), os.path.join(src_dir, "compose_tryon.py"), compose_args):
         sys.exit(1)
 
-    # 5. Result Compositing
-    print("\n=== PHASE 5: RESULT COMPOSITING ===")
-    comp_path = os.path.join(o_root, "final", "tryon_with_background.png")
-    composite_cmd = [
-        "--original", person_img,
-        "--tryon", final_output,
-        "--rembg_mask", person_no_bg, # This is actually the person image with background removed, not just the mask
-        "--output", comp_path
-    ]
-    # We can use stylevton env or densepose env for this, it just needs PIL and numpy
-    if not run_cmd(conda_python(args.stylevton_env), os.path.join(p_root, "src/restore_background.py"), composite_cmd):
-        print("Warning: Background restoration failed, but tryon result is preserved.")
+    print("\n=== STAGE 8: RESTORE ORIGINAL BACKGROUND ===")
+    if not run_cmd(
+        conda_python(args.compose_env),
+        os.path.join(src_dir, "restore_background.py"),
+        ["--original", person_img, "--tryon", tryon_rgba, "--rembg_mask", person_no_bg, "--output", comp_path],
+    ):
+        print("Warning: Background restoration failed, but tryon RGBA is available.")
 
-    print("\n" + "="*50)
-    print("MASTER PIPELINE COMPLETED SUCCESSFULLY!")
-    print(f"Final Tryon: {final_output}")
-    print(f"Composite Result: {comp_path}")
-    print("="*50)
+    print("\n" + "=" * 60)
+    print("NEW FVNT PIPELINE COMPLETED SUCCESSFULLY")
+    print(f"Try-on RGBA: {tryon_rgba}")
+    print(f"Final output: {comp_path}")
+    print("=" * 60)
+
 
 if __name__ == "__main__":
     main()

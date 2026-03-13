@@ -137,6 +137,34 @@ def main():
     final_map = np.argmax(pred, axis=0).astype(np.uint8)
     out_img = Image.fromarray(final_map)
     out_img.save(os.path.join(args.output_dir, "predicted_parsing.png"))
+
+    palette = np.array([
+        [0, 0, 0],
+        [128, 0, 0],
+        [255, 0, 0],
+        [0, 85, 0],
+        [170, 0, 51],
+        [255, 85, 0],
+        [0, 0, 85],
+        [0, 119, 221],
+        [85, 85, 0],
+        [0, 85, 85],
+        [85, 51, 0],
+        [52, 86, 128],
+        [0, 128, 0],
+        [0, 0, 255],
+        [51, 170, 221],
+        [0, 255, 255],
+        [85, 255, 170],
+        [170, 255, 85],
+        [255, 255, 0],
+        [255, 170, 0],
+    ], dtype=np.uint8)
+    rgb_map = palette[np.minimum(final_map, len(palette) - 1)]
+    Image.fromarray(rgb_map, mode="RGB").save(os.path.join(args.output_dir, "predicted_parsing_rgb.png"))
+
+    upper_clothes_mask = (final_map == 5).astype(np.uint8) * 255
+    Image.fromarray(upper_clothes_mask, mode="L").save(os.path.join(args.output_dir, "predicted_upper_clothes_mask.png"))
     
     # Save the raw 20-channel data (optional for FEM)
     np.save(os.path.join(args.output_dir, "predicted_parsing_20ch.npy"), pred)

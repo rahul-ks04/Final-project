@@ -14,18 +14,18 @@ def restore_background(original_jpg, tryon_result_png, rembg_person_png, output_
     
     W_orig, H_orig = original.size
     
-    # 2. Extract alpha mask from rembg output
-    # This mask tells us exactly where the person is in the original image
-    alpha = np.array(rembg_person)[:, :, 3]
-    mask = (alpha > 0).astype(np.float32)
+    # 2. Extract soft alpha from rembg output.
+    # Using soft alpha avoids dark/bright edge halos from hard binary compositing.
+    alpha = np.array(rembg_person)[:, :, 3].astype(np.float32) / 255.0
+    mask = cv2.GaussianBlur(alpha, (5, 5), 0)
+    mask = np.clip(mask, 0.0, 1.0)
     
     # 3. Resize tryon result to original size
     tryon_resized = tryon.resize((W_orig, H_orig), Image.LANCZOS)
     tryon_np = np.array(tryon_resized).astype(np.float32)
     original_np = np.array(original).astype(np.float32)
     
-    # 4. Composite
-    # result = tryon * Mask + original * (1 - Mask)
+    # 4. Composite with soft alpha.
     mask_3d = mask[:, :, None]
     composite_np = tryon_np * mask_3d + original_np * (1.0 - mask_3d)
     

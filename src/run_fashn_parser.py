@@ -8,6 +8,36 @@ import argparse
 from tqdm import tqdm
 from pathlib import Path
 
+# CIHP 20-class colour palette (one RGB triple per label index 0-19)
+CIHP_PALETTE = np.array([
+    [0,   0,   0],   # 0  background
+    [128, 0,   0],   # 1  hat
+    [255, 0,   0],   # 2  hair
+    [0,   85,  0],   # 3  glove
+    [170, 0,   51],  # 4  sunglasses
+    [255, 85,  0],   # 5  upper-clothes
+    [0,   0,   85],  # 6  dress
+    [0,   119, 221], # 7  coat
+    [85,  85,  0],   # 8  socks
+    [0,   85,  85],  # 9  pants
+    [85,  51,  0],   # 10 torso-skin
+    [52,  86,  128], # 11 scarf
+    [0,   128, 0],   # 12 skirt
+    [0,   0,   255], # 13 face
+    [51,  170, 221], # 14 left-arm
+    [0,   255, 255], # 15 right-arm
+    [85,  255, 170], # 16 left-leg
+    [170, 255, 85],  # 17 right-leg
+    [255, 255, 0],   # 18 left-shoe
+    [255, 170, 0],   # 19 right-shoe
+], dtype=np.uint8)
+
+
+def parse_map_to_rgb(parse_map: np.ndarray) -> np.ndarray:
+    """Convert a (H, W) label map to an (H, W, 3) RGB visualisation."""
+    rgb = CIHP_PALETTE[np.clip(parse_map, 0, len(CIHP_PALETTE) - 1)]
+    return rgb
+
 # CIHP / LIP 20-class schema (expected by FVNT PAM)
 CIHP_LABELS = {
     "background": 0,
@@ -92,9 +122,13 @@ def run_parser(input_dir, output_dir):
     print(f"Processing {len(img_paths)} images...")
     for img_path in tqdm(img_paths):
         parse_map = parser.predict(str(img_path))
+        # Raw label map (palette PNG, uint8 label indices)
         out_path = os.path.join(output_dir, img_path.stem + ".png")
         Image.fromarray(parse_map).save(out_path)
-    
+        # RGB visualisation
+        rgb_path = os.path.join(output_dir, img_path.stem + "_rgb.png")
+        Image.fromarray(parse_map_to_rgb(parse_map)).save(rgb_path)
+
     print(f"Done. Parse maps saved to: {output_dir}")
 
 if __name__ == "__main__":

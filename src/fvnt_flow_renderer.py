@@ -331,15 +331,6 @@ def main():
     Image.fromarray(warped_mask_np, mode='L').save(warped_mask_path)
     print(f"    Saved: {warped_mask_path}")
     
-    # Save flow visualization for coarse→fine levels
-    for idx, flow_level in enumerate(flow_list):
-        flow_np = flow_level[0].permute(1, 2, 0).cpu().numpy()
-        flow_vis = flow_to_image(flow_np)
-        flow_vis_img = Image.fromarray(flow_vis, mode='RGB')
-        flow_level_path = os.path.join(args.output_dir, f"flow_level_{idx}.png")
-        flow_vis_img.save(flow_level_path)
-        print(f"    Saved: {flow_level_path}")
-    
     # Save final flow field as numpy for Stage 3 FEM
     flow_final_np = flow_final[0].cpu().numpy()
     flow_final_npy_path = os.path.join(args.output_dir, "flow_field.npy")

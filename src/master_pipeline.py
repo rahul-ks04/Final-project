@@ -90,6 +90,8 @@ def main():
     rembg_dir = os.path.join(o_root, "rembg")
     garment_dir = os.path.join(o_root, "garment")
     parse_dir = os.path.join(o_root, "parse")
+    garment_parse_input_dir = os.path.join(o_root, "garment_parse_input")
+    garment_parse_dir = os.path.join(o_root, "garment_parse")
     pose_dir = os.path.join(o_root, "mediapipe")
     pam_dir = os.path.join(o_root, "pam")
     flow_dir = os.path.join(o_root, "flow_renderer")
@@ -133,6 +135,28 @@ def main():
 
     print("\n=== STAGE 2: GARMENT PREPROCESSING ===")
     pre_garment_args = ["--type", args.type, "--input", garment_img, "--output_dir", garment_dir]
+    if args.type == "worn":
+        print("[*] Worn garment mode: parsing garment image to extract upper-clothes mask.")
+        os.makedirs(garment_parse_input_dir, exist_ok=True)
+        os.makedirs(garment_parse_dir, exist_ok=True)
+
+        garment_parse_input_path = os.path.join(garment_parse_input_dir, os.path.basename(garment_img))
+        shutil.copy2(garment_img, garment_parse_input_path)
+
+        if not run_cmd(
+            conda_python(args.parser_env),
+            os.path.join(src_dir, "run_fashn_parser.py"),
+            ["--input_dir", garment_parse_input_dir, "--output_dir", garment_parse_dir],
+        ):
+            sys.exit(1)
+
+        garment_stem = os.path.splitext(os.path.basename(garment_img))[0]
+        garment_parse_mask = os.path.join(garment_parse_dir, f"{garment_stem}.png")
+        if not os.path.isfile(garment_parse_mask):
+            print(f"!!! Error: Could not find parsed garment mask at {garment_parse_mask}")
+            sys.exit(1)
+        pre_garment_args += ["--parse_mask", garment_parse_mask]
+
     if not run_cmd(conda_python(args.preprocess_env), os.path.join(src_dir, "preprocess_garment.py"), pre_garment_args):
         sys.exit(1)
 

@@ -5,7 +5,7 @@ import argparse
 import torch
 from PIL import Image
 
-def preprocess_garment(garment_path, garment_type, output_dir, schp_mask_path=None):
+def preprocess_garment(garment_path, garment_type, output_dir, parse_mask_path=None):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
@@ -33,18 +33,16 @@ def preprocess_garment(garment_path, garment_type, output_dir, schp_mask_path=No
         # Ensure mask is binary
         _, mask = cv2.threshold(mask, 10, 255, cv2.THRESH_BINARY)
     else:
-        # For worn garments, we use the parsing mask from SCHP
-        if schp_mask_path and os.path.exists(schp_mask_path):
-            # MUST use PIL to read SCHP output — it's a palette PNG.
-            # cv2.imread in grayscale converts palette colors to grayscale
-            # values, losing the actual label indices.
-            parse_img = Image.open(schp_mask_path)
+        # For worn garments, we use the parsing mask from the parser stage.
+        if parse_mask_path and os.path.exists(parse_mask_path):
+            # Keep raw label indices by loading via PIL (not OpenCV grayscale).
+            parse_img = Image.open(parse_mask_path)
             parse_mask = np.array(parse_img)
             parse_mask = cv2.resize(parse_mask, (768, 1024), interpolation=cv2.INTER_NEAREST)
             # LIP/SCHP labels: 5 = Upper-clothes, 6 = Dress, 7 = Coat
             mask = np.where(np.isin(parse_mask, [5, 6, 7]), 255, 0).astype(np.uint8)
         else:
-            print("Warning: Worn garment type selected but no SCHP mask provided. Using threshold fallback.")
+            print("Warning: Worn garment type selected but no parse mask provided. Using threshold fallback.")
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
 
@@ -64,8 +62,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--type", choices=["flat", "worn"], required=True)
     parser.add_argument("--input", required=True)
-    parser.add_argument("--schp_mask", help="Path to SCHP mask (required for worn type)")
+    parser.add_argument("--parse_mask", help="Path to parser output mask (required for worn type)")
+    parser.add_argument("--schp_mask", help="Deprecated alias for --parse_mask")
     parser.add_argument("--output_dir", required=True)
     
     args = parser.parse_args()
-    preprocess_garment(args.input, args.type, args.output_dir, args.schp_mask)
+    mask_path = args.parse_mask if args.parse_mask else args.schp_mask
+    preprocess_garment(args.input, args.type, args.output_dir, mask_path)

@@ -65,6 +65,20 @@ def compute_uncovered_holes(erase_mask, paste_alpha):
 
 
 def match_skin_tone(inpaint_rgb, person_rgb, parse, uncovered_holes, erase_mask, hand_mask=None):
+    # LaMa may return padded output sizes on some inputs; align all tensors to
+    # the mask size so boolean indexing is always valid.
+    target_h, target_w = uncovered_holes.shape[:2]
+    if inpaint_rgb.shape[:2] != (target_h, target_w):
+        inpaint_rgb = cv2.resize(inpaint_rgb.astype(np.float32), (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+    if person_rgb.shape[:2] != (target_h, target_w):
+        person_rgb = cv2.resize(person_rgb.astype(np.float32), (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+    if parse.shape[:2] != (target_h, target_w):
+        parse = cv2.resize(parse.astype(np.uint8), (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    if erase_mask.shape[:2] != (target_h, target_w):
+        erase_mask = cv2.resize(erase_mask.astype(np.float32), (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+    if hand_mask is not None and hand_mask.shape[:2] != (target_h, target_w):
+        hand_mask = cv2.resize(hand_mask.astype(np.float32), (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+
     # Priority for skin reference: palm (most reliable) > face > visible arm skin.
     ref_pixels = None
 

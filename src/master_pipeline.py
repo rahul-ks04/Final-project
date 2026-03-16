@@ -4,6 +4,8 @@ import os
 import shutil
 import subprocess
 import sys
+from PIL import Image
+from PIL import Image
 
 
 def run_cmd(python_cmd, script_path, args, cwd=None):
@@ -40,6 +42,70 @@ def find_input(project_root, pattern, label):
             if m.lower().endswith(ext):
                 return m
     return matches[0]
+
+
+def normalize_to_viton_hd(image_path, output_root, name_prefix):
+    """Center-crop to VITON-HD aspect ratio and resize to 768x1024."""
+    target_w, target_h = 768, 1024
+    img = Image.open(image_path).convert("RGB")
+    w, h = img.size
+
+    if (w, h) == (target_w, target_h):
+        return image_path
+
+    target_ratio = target_w / target_h
+    src_ratio = (w / h) if h > 0 else target_ratio
+
+    if src_ratio > target_ratio:
+        # Too wide: crop left/right.
+        new_w = int(round(h * target_ratio))
+        x0 = max(0, (w - new_w) // 2)
+        img = img.crop((x0, 0, x0 + new_w, h))
+    else:
+        # Too tall: crop top/bottom.
+        new_h = int(round(w / target_ratio))
+        y0 = max(0, (h - new_h) // 2)
+        img = img.crop((0, y0, w, y0 + new_h))
+
+    img = img.resize((target_w, target_h), Image.LANCZOS)
+    norm_dir = os.path.join(output_root, "normalized_inputs")
+    os.makedirs(norm_dir, exist_ok=True)
+    out_path = os.path.join(norm_dir, f"{name_prefix}_vitonhd.png")
+    img.save(out_path)
+    print(f"[*] Normalized {name_prefix} to 768x1024: {out_path}")
+    return out_path
+
+
+def normalize_person_to_viton_hd(person_path, output_root):
+    """Center-crop to VITON-HD aspect ratio and resize to 768x1024."""
+    target_w, target_h = 768, 1024
+    img = Image.open(person_path).convert("RGB")
+    w, h = img.size
+
+    if (w, h) == (target_w, target_h):
+        return person_path
+
+    target_ratio = target_w / target_h
+    src_ratio = w / h if h > 0 else target_ratio
+
+    if src_ratio > target_ratio:
+        # Too wide: crop left/right.
+        new_w = int(round(h * target_ratio))
+        x0 = max(0, (w - new_w) // 2)
+        img = img.crop((x0, 0, x0 + new_w, h))
+    else:
+        # Too tall: crop top/bottom.
+        new_h = int(round(w / target_ratio))
+        y0 = max(0, (h - new_h) // 2)
+        img = img.crop((0, y0, w, y0 + new_h))
+
+    img = img.resize((target_w, target_h), Image.LANCZOS)
+    norm_dir = os.path.join(output_root, "normalized_inputs")
+    os.makedirs(norm_dir, exist_ok=True)
+    out_path = os.path.join(norm_dir, "person_vitonhd.png")
+    img.save(out_path)
+    print(f"[*] Normalized person image to 768x1024: {out_path}")
+    return out_path
 
 
 def main():
@@ -80,6 +146,13 @@ def main():
 
     person_img = args.person if args.person else find_input(p_root, "person.*", "person image")
     garment_img = args.garment if args.garment else find_input(p_root, "garment.*", "garment image")
+
+    # Normalize arbitrary screenshots to VITON-HD geometry before all stages.
+    person_img = normalize_to_viton_hd(person_img, o_root, "person")
+    garment_img = normalize_to_viton_hd(garment_img, o_root, "garment")
+
+    # Make arbitrary screenshots compatible with VITON-HD pipeline dimensions.
+    person_img = normalize_person_to_viton_hd(person_img, o_root)
 
     print("--- Using Inputs ---")
     print(f"Person : {person_img}")

@@ -73,6 +73,35 @@ def mediapipe_to_openpose18(landmarks, width, height):
     return k
 
 
+def draw_openpose18(keypoints_18, image):
+    pose_vis = image.copy()
+    pairs = [
+        (1, 0), (1, 2), (2, 3), (3, 4),
+        (1, 5), (5, 6), (6, 7),
+        (1, 8), (8, 9), (9, 10),
+        (1, 11), (11, 12), (12, 13),
+        (0, 14), (14, 16), (0, 15), (15, 17),
+    ]
+
+    for start_idx, end_idx in pairs:
+        start_pt = keypoints_18[start_idx]
+        end_pt = keypoints_18[end_idx]
+        if start_pt[2] > 0 and end_pt[2] > 0:
+            cv2.line(
+                pose_vis,
+                (int(start_pt[0]), int(start_pt[1])),
+                (int(end_pt[0]), int(end_pt[1])),
+                (0, 255, 0),
+                2,
+            )
+
+    for x, y, confidence in keypoints_18:
+        if confidence > 0:
+            cv2.circle(pose_vis, (int(x), int(y)), 4, (0, 0, 255), -1)
+
+    return pose_vis
+
+
 def run_pose(input_path, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -95,6 +124,7 @@ def run_pose(input_path, output_dir):
         raise RuntimeError("No person landmarks detected by MediaPipe Pose.")
 
     keypoints_18 = mediapipe_to_openpose18(result.pose_landmarks.landmark, w, h)
+    pose_vis = draw_openpose18(keypoints_18, img)
 
     output = {
         "people": [
@@ -149,8 +179,12 @@ def run_pose(input_path, output_dir):
     hand_mask_path = os.path.join(output_dir, f"{base}_hands_mask.png")
     cv2.imwrite(hand_mask_path, hand_mask)
 
+    pose_vis_path = os.path.join(output_dir, f"{base}_pose_vis.png")
+    cv2.imwrite(pose_vis_path, pose_vis)
+
     print(f"Saved pose JSON: {out_json}")
     print(f"Saved hand mask: {hand_mask_path}")
+    print(f"Saved pose visualization: {pose_vis_path}")
     print(f"Average confidence: {float(np.mean(keypoints_18[:, 2])):.3f}")
 
 

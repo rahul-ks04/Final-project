@@ -182,25 +182,25 @@ def load_pam_output(pam_npy_path, device):
     pam_data = np.squeeze(pam_data)
     
     if pam_data.ndim == 2:
-        # If 2D (label map), convert to 20-channel one-hot
+        # Already a label map.
         label_map = pam_data.astype(np.int32)
-        pam_20ch = np.zeros((20, pam_data.shape[0], pam_data.shape[1]))
-        for c in range(20):
-            pam_20ch[c] = (label_map == c).astype(np.float32)
     else:
-        pam_20ch = pam_data
+        # PAM output is logits/probabilities; convert to class labels first.
+        label_map = np.argmax(pam_data, axis=0).astype(np.int32)
+
+    # Convert labels to one-hot 20-channel parsing.
+    h, w = label_map.shape
+    pam_20ch = np.zeros((20, h, w), dtype=np.float32)
+    for c in range(20):
+        pam_20ch[c] = (label_map == c).astype(np.float32)
     
     # Only keep upper-body clothing categories for tops try-on.
     # Channel indices correspond to the 20-class CIHP/LIP schema.
     upper_body_channels = [5, 6, 7]
     target_cloth_20 = np.zeros((20, pam_20ch.shape[1], pam_20ch.shape[2]))
 
-    for i in upper_body_channels:
-        target_cloth_20[i] = pam_20ch[i]
-
-    # Clean noisy cloth support from PAM before stage-2 flow estimation.
-    cloth_union = np.sum(target_cloth_20[upper_body_channels], axis=0)
-    cloth_mask = (cloth_union > 0.5).astype(np.uint8)
+    # Build cloth support from semantic labels, then clean.
+    cloth_mask = np.isin(label_map, upper_body_channels).astype(np.uint8)
     cloth_mask = cv2.morphologyEx(cloth_mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), iterations=1)
     cloth_mask = cv2.morphologyEx(cloth_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
 
@@ -212,7 +212,7 @@ def load_pam_output(pam_npy_path, device):
         cloth_mask = (labels == keep_label).astype(np.uint8)
 
     for i in upper_body_channels:
-        target_cloth_20[i] = target_cloth_20[i] * cloth_mask.astype(np.float32)
+        target_cloth_20[i] = pam_20ch[i] * cloth_mask.astype(np.float32)
     
     return torch.from_numpy(target_cloth_20).float().unsqueeze(0).to(device)
 

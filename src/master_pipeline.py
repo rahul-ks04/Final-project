@@ -132,7 +132,7 @@ def main():
 
     # Checkpoints
     parser.add_argument("--pam_ckpt", default="", help="Optional explicit PAM checkpoint path")
-    parser.add_argument("--fvnt_ckpt", default="d:/VITON/FVNT/model/stage2_model", help="FVNT stage-2 checkpoint path")
+    parser.add_argument("--fvnt_ckpt", default="d:/VITON/FVNT/model/stage2_model_finetuned_latest", help="FVNT stage-2 checkpoint path")
 
     args = parser.parse_args()
 

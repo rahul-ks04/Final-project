@@ -1,0 +1,468 @@
+VITON PROJECT REPORT - PATH A PIPELINE (DETAILED)
+Date: 2026-03-22
+
+Scope
+- This report explains the full Path A pipeline used in this repository.
+- It ignores all notebooks.
+- It ignores Path B components, including master_pipeline_trial and fvnt_test_launcher.
+- The report is based on source scripts in src/ and their real data flow.
+
+Main Orchestration
+- Entry script: src/master_pipeline.py
+- High-level stages:
+  1) Input discovery and normalization
+  2) Person background removal
+  3) Garment preprocessing
+  4) Person parsing (CIHP/LIP 20 classes)
+  5) Pose extraction (OpenPose-18 format from MediaPipe)
+  6) PAM prediction (FVNT Stage-1)
+  7) Flow rendering and garment warping (FVNT Stage-2)
+  8) Composition + hole handling/inpainting
+  9) Original background restoration
+
+============================================================
+PART 1: INPUT HANDLING AND NORMALIZATION
+============================================================
+Component
+- Functions inside src/master_pipeline.py:
+  - find_input(...)
+  - normalize_to_viton_hd(...)
+  - normalize_person_to_viton_hd(...)
+
+Why it is used
+- Model stages in this project assume VITON-HD-like framing.
+- Real user images can be arbitrary aspect ratios and resolutions.
+- Normalization reduces geometric mismatch and improves downstream consistency.
+
+Inputs
+- Person image path (explicit --person or auto-detected in inputs/person.*)
+- Garment image path (explicit --garment or auto-detected in inputs/garment.*)
+
+Processing
+- Center-crop image to VITON-HD aspect ratio.
+- Resize to 768x1024.
+- Save normalized images under output_root/normalized_inputs.
+
+Outputs
+- output_root/normalized_inputs/person_vitonhd.png (or person_vitonhd naming path)
+- output_root/normalized_inputs/garment_vitonhd.png
+
+Notes
+- Normalization happens before all model stages.
+- This stage prevents downstream parser/pose/PAM/warping failures from odd image geometry.
+
+============================================================
+PART 2: PERSON BACKGROUND REMOVAL
+============================================================
+Component
+- Script: src/remove_background.py
+
+Why it is used
+- The pipeline composites synthesized garment results over person foreground.
+- Clean person alpha matte is needed for robust compositing and later background restoration.
+
+Inputs
+- Normalized person image.
+
+Processing
+- Uses rembg.remove(...) on the person image.
+- Produces transparent person RGBA image.
+- Derives a blacked-out background image for diagnostics.
+
+Outputs
+- output_root/rembg/person.png (RGBA, person foreground with alpha)
+- output_root/rembg/background.png
+
+How outputs are used later
+- person.png alpha is used by composition and final restore_background stage.
+
+============================================================
+PART 3: GARMENT PREPROCESSING
+============================================================
+Component
+- Script: src/preprocess_garment.py
+
+Why it is used
+- Flow and composition need a clean garment RGB and binary garment support mask.
+- The model pipeline expects fixed garment size and mask semantics.
+
+Inputs
+- Garment image
+- Garment type: flat or worn
+- Optional parse mask for worn garment mode
+
+Processing
+- Resizes garment to 768x1024.
+- For flat garments:
+  - Uses rembg to extract alpha, thresholds to binary mask.
+- For worn garments:
+  - Uses parser mask labels {5,6,7} for upper clothing extraction.
+- Saves cloth image and mask.
+- Saves source_parsing.pt compatibility tensor.
+
+Outputs
+- output_root/garment/cloth.png
+- output_root/garment/cloth_mask.png
+- output_root/garment/source_parsing.pt
+
+How outputs are used later
+- run_pam.py consumes cloth and cloth_mask.
+- fvnt_flow_renderer.py uses cloth image and cloth mask for warping.
+
+============================================================
+PART 4: PERSON PARSING (SEMANTIC SEGMENTATION)
+============================================================
+Component
+- Script: src/run_fashn_parser.py
+
+Why it is used
+- Semantic labels define body/clothing regions needed by PAM and composition.
+- Provides structured guidance beyond raw RGB pixels.
+
+Inputs
+- Parse input directory (master pipeline copies normalized person image there).
+
+Processing
+- Loads SegFormer clothes model.
+- Runs per-image inference.
+- Upsamples logits to original size.
+- Argmax to predicted labels.
+- Remaps model labels into CIHP/LIP-style 20-class schema expected by this project.
+- Saves label map and RGB visualization.
+
+Outputs
+- output_root/parse/person.png (label map PNG)
+- output_root/parse/person_rgb.png (color visualization)
+
+How outputs are used later
+- run_pam.py uses parse map as target-person semantic context.
+- compose_tryon.py uses labels to preserve face/hair and control erasing/restoration.
+
+============================================================
+PART 5: POSE AND HAND EXTRACTION
+============================================================
+Component
+- Script: src/run_pose_mediapipe.py
+
+Why it is used
+- PAM Stage-1 expects OpenPose-18 keypoint format.
+- Hand/finger mask protects fingers during erase/inpaint steps in composition.
+
+Inputs
+- Person image.
+
+Processing
+- Runs MediaPipe Pose.
+- Converts selected landmarks into OpenPose-18 ordering:
+  - nose, neck, shoulders, elbows, wrists, hips, knees, ankles, eyes, ears.
+- Saves keypoints JSON in OpenPose-like structure.
+- Runs MediaPipe Hands.
+- Builds hand mask via convex hull + fingertip/palm circles + dilation.
+- Saves visualization image.
+
+Outputs
+- output_root/mediapipe/{stem}_keypoints.json
+- output_root/mediapipe/{stem}_hands.json
+- output_root/mediapipe/{stem}_hands_mask.png
+- output_root/mediapipe/{stem}_pose_vis.png
+
+How outputs are used later
+- PAM uses keypoints JSON to create 18 pose channels.
+- Composition uses hands_mask to avoid finger corruption.
+
+============================================================
+PART 6: PAM PREDICTION (FVNT STAGE-1)
+============================================================
+Component
+- Primary script: src/run_pam.py
+- Optional fallback: src/make_pam_from_parse.py (pam_mode=from_parse)
+
+Why it is used
+- Predicts target parsing structure aligned with the desired garment transfer.
+- Produces structured conditioning for Stage-2 flow estimation.
+
+Inputs
+- Cloth RGB: output_root/garment/cloth.png
+- Cloth mask: output_root/garment/cloth_mask.png
+- Person parse map: output_root/parse/person.png
+- Pose JSON: output_root/mediapipe/{stem}_keypoints.json
+- Original person image (for coordinate scaling)
+- PAM checkpoint path
+
+Processing details (run_pam.py)
+- Resizes into model space: width=192, height=256.
+- Builds input channels in training-consistent order:
+  - 3 channels cloth RGB (masked)
+  - 20 channels source cloth parsing proxy
+  - 1 channel HFS mask (hair/face/shoes)
+  - 18 channels pose heatmaps
+  Total: 42 channels
+- Runs Stage-1 generator network.
+- Produces 20-channel output (logits/probabilities).
+- Saves argmax parsing and channel tensor.
+
+Outputs
+- output_root/pam/predicted_parsing_20ch.npy
+- output_root/pam/predicted_parsing.png
+- output_root/pam/predicted_parsing_rgb.png
+- output_root/pam/predicted_upper_clothes_mask.png
+
+Fallback mode (make_pam_from_parse.py)
+- Converts parse label map directly to one-hot 20 channels.
+- Used for debugging when learned PAM should be bypassed.
+
+============================================================
+PART 7: FLOW RENDERER AND GARMENT WARPING (FVNT STAGE-2)
+============================================================
+Component
+- Script: src/fvnt_flow_renderer.py
+
+Why it is used
+- Core geometric alignment stage.
+- Predicts dense optical flow that deforms source garment to target person layout.
+
+Inputs
+- output_root/pam/predicted_parsing_20ch.npy
+- output_root/garment/cloth.png
+- output_root/garment/cloth_mask.png
+- Stage-2 checkpoint (default points to FVNT/model/stage2_model_finetuned_latest)
+
+Processing
+- Injects deformable convolution fallback module in FVNT/Deformable.
+- Converts PAM output into cleaned upper-body target cloth support (channels 5,6,7).
+- Builds source garment 20-channel representation.
+- Loads garment RGB in model space.
+- Runs Stage_2_generator to predict multi-scale flows.
+- Uses finest flow field to warp:
+  - garment RGB
+  - garment binary mask
+- Applies warped mask to constrain warped garment support.
+
+Outputs
+- output_root/flow_renderer/warped_garment.png
+- output_root/flow_renderer/warped_mask.png
+- output_root/flow_renderer/flow_field.npy
+- output_root/flow_renderer/target_parsing_rgb.png
+- output_root/flow_renderer/target_cloth_mask.png
+- output_root/flow_renderer/source_parsing_rgb.png
+
+Why this stage is critical
+- If flow is poor, garment shape/placement will be incorrect even if parsing is accurate.
+
+============================================================
+PART 8: COMPOSITION + HOLE HANDLING + (OPTIONAL) LAMA INPAINT
+============================================================
+Component
+- Script: src/compose_tryon.py
+
+Why it is used
+- Merges warped garment with person foreground while preserving identity and reducing artifacts.
+- Handles sleeve-length mismatch, exposed skin holes, and hand preservation.
+
+Inputs
+- original person RGBA: output_root/rembg/person.png
+- person parse map: output_root/parse/person.png
+- warped cloth RGB: output_root/flow_renderer/warped_garment.png
+- warped cloth mask: output_root/flow_renderer/warped_mask.png
+- hand mask: output_root/mediapipe/{stem}_hands_mask.png
+- flags:
+  - --no_inpaint_skin
+  - --inpaint_arms
+  - --erase_arms_under_cloth
+
+Core mask groups
+- PRESERVE_LABELS: face/hair/sunglasses/hat style regions
+- GARMENT_LABELS: old upper garment-related labels
+- ARM_LABELS: arm labels
+- LOWER_LABELS: lower body labels
+
+Processing logic
+- Build protection mask to preserve critical identity regions.
+- Erase old garment area (dilated) from person canvas.
+- Optionally erase arms under cloth depending on flags.
+- Paste warped garment with soft blending mask.
+- Detect uncovered holes: erased regions not covered by pasted cloth.
+- If inpainting enabled and SimpleLaMa available:
+  - Inpaint holes
+  - Skin-tone match inpainted pixels to reference skin (priority hand then face then visible arm)
+- If no inpainting, restore original pixels in holes.
+- Restore arm pixels in non-covered areas as a safety pass.
+- Restore preserve region last.
+
+Outputs
+- output_root/final/tryon_result.png (RGBA)
+- debug masks in output_root/final/:
+  - dbg_warped_mask.png
+  - dbg_paste_mask_soft.png
+  - dbg_erase_mask.png
+  - dbg_hole_mask_raw.png
+  - dbg_hole_mask_inpaint.png
+  - dbg_hand_mask.png
+  - dbg_arm_restore_region.png
+
+============================================================
+PART 9: RESTORE ORIGINAL BACKGROUND
+============================================================
+Component
+- Script: src/restore_background.py
+
+Why it is used
+- Produces final realistic photo by placing synthesized person back into original scene.
+
+Inputs
+- Original person image (with background)
+- Try-on result RGBA from composition
+- rembg person RGBA (for soft alpha)
+
+Processing
+- Reads alpha channel from rembg person image.
+- Applies slight blur to alpha for smoother edge blending.
+- Composites try-on RGB over original RGB using soft alpha.
+
+Outputs
+- output_root/final/tryon_with_background.png
+
+This is the primary final output for visual comparison and metric evaluation.
+
+============================================================
+PART 10: BATCH RUNNER FOR DATASET EVALUATION (PATH A)
+============================================================
+Component
+- Script: src/batch_runner.py
+
+Why it is used
+- Automates running Path A over multiple paired test samples.
+- Ensures reproducibility with saved pair lists.
+
+Inputs
+- dataset_root (expects VITON-HD-like test/image and test/cloth)
+- output_root
+- n_samples, seed, optional fixed pairs_file
+- env and conda settings
+
+Processing
+- Picks valid paired IDs (same stem in image and cloth).
+- Saves fixed pairs to eval_pairs.txt.
+- Copies GT images into _gt.
+- Copies parse maps into _parse.
+- Runs master_pipeline.py once per sample.
+
+Outputs
+- output_root/eval_pairs.txt
+- output_root/_gt/*.jpg
+- output_root/_parse/*.png
+- output_root/{sample_id}/... full per-sample artifacts and final outputs
+
+============================================================
+PART 11: METRICS COMPUTATION
+============================================================
+Component A
+- Script: src/compute_metrics.py
+
+Why it is used
+- Quantifies generation quality with perceptual and reconstruction metrics.
+
+Inputs
+- eval_root from batch_runner
+- generated_subpath (default final/tryon_with_background.png)
+- GT images from eval_root/_gt
+- Parse maps from eval_root/_parse
+
+Metrics computed
+- SSIM
+- PSNR
+- LPIPS (optional, package-dependent)
+- MSE
+- FID (optional, torchmetrics-dependent)
+- IS (optional, torchmetrics-dependent)
+
+Masking policy
+- Upper-body evaluation mask from labels {5,6,7,10,11,14,15}
+- Falls back to full image if parse map missing/degenerate.
+
+Outputs
+- eval_root/metrics.csv
+- Per-sample rows + mean summary row
+
+Component B
+- Script: src/compare_mse_protocols.py
+
+Why it is used
+- Reports MSE under multiple conventions for fair external comparison.
+
+Protocols
+- masked_01
+- full_01
+- masked_255
+- full_255
+
+Outputs
+- eval_root/mse_protocols.csv
+
+============================================================
+PART 12: ENVIRONMENT SPLIT STRATEGY
+============================================================
+Component
+- Managed in src/master_pipeline.py through stage-specific conda env arguments.
+
+Why it is used
+- Different dependencies are heavy/incompatible across stages.
+- Isolates parser, PAM/FVNT, and compose/inpainting dependencies.
+
+Typical defaults in script
+- preprocess_env: densepose
+- parser_env: densepose
+- pam_env: fvnt_env
+- fvnt_env: fvnt_env
+- compose_env: densepose
+
+Benefit
+- More stable execution and easier dependency management.
+
+============================================================
+PART 13: IMPORTANT FILE CONTRACTS (QUICK REFERENCE)
+============================================================
+Primary intermediate artifacts
+- rembg/person.png
+- garment/cloth.png
+- garment/cloth_mask.png
+- parse/person.png
+- mediapipe/{stem}_keypoints.json
+- mediapipe/{stem}_hands_mask.png
+- pam/predicted_parsing_20ch.npy
+- flow_renderer/warped_garment.png
+- flow_renderer/warped_mask.png
+- final/tryon_result.png
+- final/tryon_with_background.png
+
+If one artifact is missing
+- Downstream stage usually fails immediately because master_pipeline.py checks return codes.
+
+============================================================
+PART 14: QUALITY-CONTROL INSIGHTS FOR THIS PIPELINE
+============================================================
+1) Geometry normalization quality directly affects all later stages.
+2) Parse quality drives mask logic and PAM guidance; parser errors propagate.
+3) Pose keypoint quality affects PAM channel conditioning.
+4) Warped mask quality strongly influences compositing seams.
+5) Hand-mask protection is important to prevent finger destruction.
+6) Inpainting is mostly for uncovered holes due to sleeve-length mismatch.
+7) Final output realism depends on both composition and background restore.
+
+============================================================
+PART 15: CONCISE END-TO-END I/O VIEW
+============================================================
+Input
+- person image + garment image
+
+Middle
+- person alpha foreground, garment mask, parse map, pose JSON, hand mask,
+  PAM 20-channel prediction, flow field, warped garment
+
+Output
+- RGBA try-on person: final/tryon_result.png
+- Final composited scene image: final/tryon_with_background.png
+
+============================================================
+END OF REPORT
+============================================================

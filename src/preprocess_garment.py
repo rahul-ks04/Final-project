@@ -33,17 +33,30 @@ def flat_mask_from_background_color(img_bgr):
     border_lab = cv2.cvtColor(border_px.reshape(-1, 1, 3), cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
     bg_med = np.median(border_lab, axis=0)
 
-    # Distance in Lab space: foreground differs from background color.
+    # Distance in Lab space relative to border-estimated background color.
     diff = img_lab.astype(np.float32) - bg_med[None, None, :]
     dist = np.sqrt(np.sum(diff * diff, axis=2))
 
-    # Robust threshold from border-distance distribution.
+    # Build background-color candidate map from border stats.
     border_dist = np.sqrt(np.sum((border_lab - bg_med[None, :]) ** 2, axis=1))
-    t = float(np.percentile(border_dist, 95) + 8.0)
-    t = max(10.0, min(t, 28.0))
-    mask = (dist > t).astype(np.uint8) * 255
+    t_bg = float(np.percentile(border_dist, 97) + 6.0)
+    t_bg = max(8.0, min(t_bg, 24.0))
+    bg_candidate = (dist <= t_bg).astype(np.uint8)
 
-    # Fill tiny holes and remove pixel noise, then keep the garment body.
+    # Keep only background regions connected to image borders. This prevents
+    # interior garment regions (e.g., white logos/stripes) from being dropped
+    # even when their color is close to the backdrop.
+    num_labels, labels = cv2.connectedComponents(bg_candidate, connectivity=8)
+    border_labels = set()
+    border_labels.update(np.unique(labels[0, :]).tolist())
+    border_labels.update(np.unique(labels[h - 1, :]).tolist())
+    border_labels.update(np.unique(labels[:, 0]).tolist())
+    border_labels.update(np.unique(labels[:, w - 1]).tolist())
+
+    bg_mask = np.isin(labels, list(border_labels)).astype(np.uint8)
+    mask = ((1 - bg_mask) * 255).astype(np.uint8)
+
+    # Clean edges and keep garment body.
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
     mask = _keep_largest_component(mask)
@@ -66,17 +79,18 @@ def preprocess_garment(garment_path, garment_type, output_dir, parse_mask_path=N
     
     # 1. Generate Garment Mask
     if garment_type == "flat":
-        if flat_mask_method == "rembg":
-            print("Using rembg for flat garment masking...")
-            from rembg import remove
-
-            pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-            rembg_img = remove(pil_img)
-            mask = np.array(rembg_img)[:, :, 3]
-            _, mask = cv2.threshold(mask, 10, 255, cv2.THRESH_BINARY)
-        else:
-            print("Using border-color segmentation for flat garment masking...")
-            mask = flat_mask_from_background_color(img)
+        # rembg path disabled per current pipeline decision.
+        # if flat_mask_method == "rembg":
+        #     print("Using rembg for flat garment masking...")
+        #     from rembg import remove
+        #
+        #     pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        #     rembg_img = remove(pil_img)
+        #     mask = np.array(rembg_img)[:, :, 3]
+        #     _, mask = cv2.threshold(mask, 10, 255, cv2.THRESH_BINARY)
+        # else:
+        print("Using border-color segmentation for flat garment masking...")
+        mask = flat_mask_from_background_color(img)
     else:
         # For worn garments, we use the parsing mask from the parser stage.
         if parse_mask_path and os.path.exists(parse_mask_path):

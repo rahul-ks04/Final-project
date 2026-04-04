@@ -5,7 +5,53 @@ import argparse
 import torch
 from PIL import Image
 
-def preprocess_garment(garment_path, garment_type, output_dir, parse_mask_path=None):
+
+def _keep_largest_component(mask_u8):
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((mask_u8 > 0).astype(np.uint8), connectivity=8)
+    if num_labels <= 1:
+        return mask_u8
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    keep_label = int(np.argmax(areas)) + 1
+    out = np.zeros_like(mask_u8)
+    out[labels == keep_label] = 255
+    return out
+
+
+def flat_mask_from_background_color(img_bgr):
+    """Segment flat garment by modeling background color from image borders."""
+    h, w = img_bgr.shape[:2]
+    border = max(8, int(0.03 * min(h, w)))
+
+    # Collect border pixels to estimate background color (catalog images: uniform backdrop).
+    top = img_bgr[:border, :, :].reshape(-1, 3)
+    bottom = img_bgr[h - border:, :, :].reshape(-1, 3)
+    left = img_bgr[:, :border, :].reshape(-1, 3)
+    right = img_bgr[:, w - border:, :].reshape(-1, 3)
+    border_px = np.vstack([top, bottom, left, right]).astype(np.uint8)
+
+    img_lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    border_lab = cv2.cvtColor(border_px.reshape(-1, 1, 3), cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
+    bg_med = np.median(border_lab, axis=0)
+
+    # Distance in Lab space: foreground differs from background color.
+    diff = img_lab.astype(np.float32) - bg_med[None, None, :]
+    dist = np.sqrt(np.sum(diff * diff, axis=2))
+
+    # Robust threshold from border-distance distribution.
+    border_dist = np.sqrt(np.sum((border_lab - bg_med[None, :]) ** 2, axis=1))
+    t = float(np.percentile(border_dist, 95) + 8.0)
+    t = max(10.0, min(t, 28.0))
+    mask = (dist > t).astype(np.uint8) * 255
+
+    # Fill tiny holes and remove pixel noise, then keep the garment body.
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+    mask = _keep_largest_component(mask)
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+
+    return mask
+
+def preprocess_garment(garment_path, garment_type, output_dir, parse_mask_path=None, flat_mask_method="color"):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
@@ -20,18 +66,17 @@ def preprocess_garment(garment_path, garment_type, output_dir, parse_mask_path=N
     
     # 1. Generate Garment Mask
     if garment_type == "flat":
-        print("Using rembg for flat garment masking...")
-        from rembg import remove
-        
-        # rembg works on PIL images
-        pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        rembg_img = remove(pil_img)
-        
-        # Mask is the alpha channel
-        mask = np.array(rembg_img)[:, :, 3]
-        
-        # Ensure mask is binary
-        _, mask = cv2.threshold(mask, 10, 255, cv2.THRESH_BINARY)
+        if flat_mask_method == "rembg":
+            print("Using rembg for flat garment masking...")
+            from rembg import remove
+
+            pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            rembg_img = remove(pil_img)
+            mask = np.array(rembg_img)[:, :, 3]
+            _, mask = cv2.threshold(mask, 10, 255, cv2.THRESH_BINARY)
+        else:
+            print("Using border-color segmentation for flat garment masking...")
+            mask = flat_mask_from_background_color(img)
     else:
         # For worn garments, we use the parsing mask from the parser stage.
         if parse_mask_path and os.path.exists(parse_mask_path):
@@ -65,7 +110,8 @@ if __name__ == "__main__":
     parser.add_argument("--parse_mask", help="Path to parser output mask (required for worn type)")
     parser.add_argument("--schp_mask", help="Deprecated alias for --parse_mask")
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--flat_mask_method", choices=["color", "rembg"], default="color")
     
     args = parser.parse_args()
     mask_path = args.parse_mask if args.parse_mask else args.schp_mask
-    preprocess_garment(args.input, args.type, args.output_dir, mask_path)
+    preprocess_garment(args.input, args.type, args.output_dir, mask_path, flat_mask_method=args.flat_mask_method)

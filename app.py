@@ -62,7 +62,7 @@ if run_button:
             'python', PIPELINE_SCRIPT,
             '--person', person_path,
             '--garment', garment_path
-        ], capture_output=True, text=True)
+        ], capture_output=True, text=True, encoding='utf-8', errors='replace')
         if result.returncode != 0:
             st.error('Pipeline failed!')
             with st.expander('Show pipeline output'):

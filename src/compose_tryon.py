@@ -157,6 +157,18 @@ def run_composition(
     support_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
     paste_support = cv2.dilate((warped_mask > 0.08).astype(np.uint8), support_kernel, iterations=1).astype(np.float32)
 
+    # Auto sleeve-mismatch handling: if new garment has low coverage on arm labels,
+    # remove arm pixels near old garment boundaries (often mis-labeled old sleeves)
+    # so inpainting can restore clean skin.
+    arm_px = float(np.sum(arm_mask > 0.5))
+    arm_cover_ratio = float(np.sum((arm_mask > 0.5) & (paste_support > 0.5))) / max(1.0, arm_px)
+    short_sleeve_like = arm_cover_ratio < 0.55
+    if short_sleeve_like:
+        old_near_arm = cv2.dilate(old_garment_mask.astype(np.uint8), np.ones((31, 31), np.uint8), iterations=1).astype(np.float32)
+        suspected_old_sleeve = arm_mask * old_near_arm * (1.0 - paste_support) * (1.0 - hand_mask)
+    else:
+        suspected_old_sleeve = np.zeros_like(arm_mask)
+
     # arm_under_cloth: optional — only erase bare arm skin when explicitly requested
     # (handles full→half where ARM label appears inside old sleeve region edge cases).
     if inpaint_arms:
@@ -166,7 +178,7 @@ def run_composition(
     else:
         arm_under_cloth = np.zeros_like(warped_mask)
 
-    erase_mask = np.clip(garment_dil + arm_under_cloth, 0.0, 1.0)
+    erase_mask = np.clip(garment_dil + arm_under_cloth + suspected_old_sleeve, 0.0, 1.0)
     erase_mask = erase_mask * (1.0 - protection)
 
     # Compose base canvas
@@ -251,7 +263,10 @@ def run_composition(
         Image.fromarray((hand_mask * 255.0).astype(np.uint8), mode="L").save(os.path.join(out_dir, "dbg_hand_mask.png"))
         Image.fromarray((arm_restore_region * 255.0).astype(np.uint8), mode="L").save(os.path.join(out_dir, "dbg_arm_restore_region.png"))
 
-    print(f"[INFO] Hole pixels raw/inpaint: {int(np.sum(uncovered_holes_raw))}/{int(np.sum(uncovered_holes))} | Inpaint applied: {did_inpaint}")
+    print(
+        f"[INFO] Hole pixels raw/inpaint: {int(np.sum(uncovered_holes_raw))}/{int(np.sum(uncovered_holes))} | "
+        f"Inpaint applied: {did_inpaint} | Arm cover ratio: {arm_cover_ratio:.3f} | Short-sleeve-like: {short_sleeve_like}"
+    )
 
     Image.fromarray(out_rgba, mode="RGBA").save(output_path)
     print(f"Saved composed try-on: {output_path}")
